@@ -1,0 +1,1027 @@
+#!/bin/sh
+##############################################################################
+#
+# pgarchive -- A PostgreSQL Archive Server
+#
+# See LICENSE for terms.
+#
+# Author: Jürgen Strobel <juergen.strobel@emarsys.com>
+#
+##############################################################################
+
+### global env
+
+# abort on all errors
+set -e
+
+# set safe PATH and default PAGER
+export PATH=/usr/pgsql-9.4/bin:/sbin:/usr/sbin:/usr/bin:/bin
+export PAGER=${PAGER:-less}
+
+# clear out incidential libpq settings
+unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE
+unset PGSERVICE PGSERVICEFILE PGREALM PGOPTIONS PGAPPNAME
+unset PGSSLMODE PGREQUIRESSL PGSSLCOMPRESSION PGSSLCERT PGSSLKEY PGSSLROOTCERT
+unset PGSSLCRL PGREQUIREPEER PGKRBSRVNAME PGGSSLIB PGCONNECT_TIMEOUT PGCLIENTENCODING
+unset PGDATA
+
+
+### internal utils
+
+datefmt='%Y-%m-%dT%R:%SZ'
+pg_ctl_timeout=900
+
+log() {
+  echo `date +"$datefmt" --utc` "$*"
+}
+
+fail() {
+    log "ERROR $*"
+    exit 1
+}
+
+debug() {
+    [[ -n "$DEBUG" ]] && log "DEBUG $*" || true
+}
+
+configure() {
+    set_container
+    [[ -d "$container" ]] || fail "$PGARCHIVE does not exist."
+    setup
+    . $config
+}
+
+set_container() {
+    [[ -n "$PGARCHIVE" ]] || fail "\$PGARCHIVE is not defined, please read 'help'."
+    container=`readlink -f $PGARCHIVE`
+}
+
+setup() {
+    config="$container/pgarchive.conf"
+    log="$container/log"
+    standby="$container/standby"
+    wal="$container/wal_archive"
+    wal="$container/wal_archive"
+    snapshots="$container/snapshots"
+    clones="$container/clones"
+
+    wallog="$log/wal_archive.log"
+    walpid="$log/wal_archive.pid"
+    slot=${SLOT:-pgarchive_$(basename "$container")}
+    standby_cleanup_position="$standby/pgarchive_cleanup_position"
+    standbylog="$log/standby/postgresql-$(date +'%a').csv"
+    cron_snapshotlog="$log/cron_snapshot.log"
+    cron_wallog="$log/cron_wal_archive.log"
+    cron_btrfslog="$log/cron_btrfs.log"
+}
+
+psql_upstream() {
+    psql -d "$upstream" -c "$1"
+}
+
+pg_ctl_cmd() {
+    pgd=$1
+    cmd=$2
+    shift 2
+    pg_ctl -D "$pgd" "$cmd" -t $pg_ctl_timeout $@
+}
+
+pg_ctl_status() {
+    pg_ctl_cmd $1 status >/dev/null 2>&1
+}
+
+incr_next_clone_port() {
+
+    next_clone_port=$((next_clone_port + 1))
+    sed -i".bak" 's/^next_clone_port=.*$'"/next_clone_port=$next_clone_port/" "$config"
+}
+
+show_log() {
+    [[ "$1" = "-f" ]] && tail -f "$2" || "$PAGER" "$2"
+}
+
+do_or_show() {
+    $@
+}
+enable_dry_run() {
+    dry_run="1"
+    do_or_show() {
+        echo "not executed: $@"
+    }
+}
+
+
+### longer & complex commands
+
+help() {
+    cat <<EOF
+PGARCHIVE=<dir> `basename $0` <cmd> <arg...>
+
+Commands and sub-commands:
+
+help                Show this help.
+
+container init      Create a new container and upstream replication slot, both of which
+                    must not exist yet. This requires additional environment variables to be set,
+                    see below. The new backup container is fully started and operational at the end,
+                    except you need to verify and enable the cron jobs (crontab -e).
+container init-cron Add a new default cron stanza to the calling user's crontab, in case word in
+                    case you messed up the original.
+container purge [--force]
+                    Completely remove the full backup location and the replication slot.
+                    Tries to read PGARCHIVE's config, and falls back to the same
+                    extra environment parameters init uses. Make sure nothing at all is needed
+                    any more, and everything is stopped.
+container start     Start backup container, which starts both wal_archive and standby processes.
+container stop      Stop backup container.
+container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
+container dashboard Show detailed status and tails of all log files.
+
+wal_archive start   Start the wal_archive process. This process connects to the upstream DB
+                    using the PostgreSQL's replication protocol, with the configured
+                    replication slot, and stores retrieved WAL segments in the wal_archive
+                    directory. Implemented by using pg_receivexlog.
+wal_archive stop    Stop the wal_archive process.
+wal_archive status  Check if the wal_archive process is running.
+wal_archive list    List wal_archive directory and size.
+wal_archive log [-f]
+                    Write wal_archive.log to stdout or tail -f it.
+                    If stdout is a terminal \$PAGER is used to show it.
+
+standby (start|stop|status|reload|restart) [arg] ...
+                    The standby process is a warm standby PostgreSQL instance which pulls
+                    completed segments from the wal_archive directory. This is a simple frontend
+                    to control it using pg_ctl, and extra arguments are passed through.
+standby log [-f]    Write today's standby log to stdout or tail -f it.
+                    If stdout is a terminal \$PAGER is used to show it.
+                    Assumes the standard weekly log rotation and CSV logging in standby/pg_log.
+
+snapshot create [--force]
+                    Create a new btrfs snapshot of the standby directory under snapshots/.
+                    With --force do this even when the standby process is not running,
+                    and or if there's no recent restartpoint.
+snapshot delete <pattern> ...
+                    Directly delete one or more snapshots, may use a simple globbing pattern.
+snapshot expire [--show]
+                    Delete snapshots older than \$expire_date, which should be defined in the
+                    config file. Passing \$EXPIRE_DATE in the environment may be used to
+                    override the config file. This also removes WAL segments which are not
+                    needed any more from the wal_archive.
+                    The format of the date must be understood by date (1) --date=STRING,
+                    and may be a relative term like "1 week ago".
+                    With --show only show the actions to be taken, but don't delete anything.
+snapshot thin [--show]
+                    Delete snapshots older than \$thin_daily_date which are not the first snapshot
+                    of a day. This allows to thin snapshot density for older data. Like expire
+                    this supports --show and overriding the config file with \$THIN_DAILY_DATE.
+snapshot list [<pattern>]
+                    List snapshots, optionally restricted to a simple globbing pattern.
+
+clone create <snapshot> <name> [<target-time>]
+                    Create a new named (PostgreSQL) clone instance from a snapshot.
+                    A new port is assigned and appended to postgresql.conf.
+                    The clone will have a recovery.conf suitable to do recovery to
+                    either the next consistent point in time, or an arbitrary target time
+                    (which should be after snapshot creation time). The clone is not
+                    started automatically, so you may edit *.conf files before
+                    initiating recovery. Recovery success depends on the wal_archive
+                    still containing all required WAL segments.
+clone duplicate <source> <target>
+                    Duplicates an existing clone instance. Note that if source is running
+                    target will have to do crash recovery once started. A new port is
+                    assigned and appended to postgresql.conf automatically.
+clone delete <name> Delete a (stopped) clone.
+clone (start|stop|status|reload|restart) <name> [arg] ...
+                    This is a simple frontend for pg_ctl to start and stop named clones.
+                    The stop command also accepts --all instead of <name>.
+clone list [--status] [<pattern>]
+                    List clones, optionally restricted to a simple globbing pattern.
+                    With --status the assigned port and pg_ctl status is given for each.
+clone log <name> [-f]
+                    Write the named clone's log to stdout or tail -f it.
+                    If stdout is a terminal \$PAGER is used to show it.
+                    Assumes the standard weekly log rotation and csv logging.
+clone psql <name> [arg] ...
+                    Open a psql shell connected to a running named clone instance.
+                    Additional arguments are passed through.
+
+cron compress-wal-archive <n>
+                    Compress completed segments in wal_archive, which have already been
+                    processed by the standby process. Run n processes in parallel (default 1).
+                    The log is written to log/cron_wal_archive.log.
+cron expire-and-create-snapshot
+                    Expire old snapshots and wal segments, thin snapshots, and create a new one.
+                    The log is written to log/cron_snapshot.log.
+cron defrag-btrfs   Defragment the standby directory, since PostgreSQL tends to cause a critical
+                    amount of fragmentation fast. Requires password-less sudo privileges to call
+                    "/sbin/btrfs filesystem defrag ...". The log is written to log/cron_btrfs.log.
+
+bash-completion     Output a bash completion snippet for this utility.
+                    This may be saved to global or personal profiles, or eval'ed directly:
+                        eval "\$(pgarchive bash-completion)"
+
+Required Environment:
+
+PGARCHIVE           Base path to a backup container, which must be on btrfs.
+
+Extra environment parameters only used by 'container init' and 'purge' commands (settings are
+persisted to \$PGARCHIVE/pgarchive.conf):
+
+SLOT                Create and use this replication slot at upstream. Defaults to
+                    "pgarchive_<basename of \$PGARCHIVE>".
+UPSTREAM            A connection info string used when accessing the upstream DB in
+                    command mode, for example when creating a SLOT or checking status. See
+                    http://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-CONNSTRING.
+                    The default value is "" (local connection, default port, user, DB etc.)
+                    This is persisted to the config file and may be edited there later.
+                    Note that common libpq environment settings (PG*) which are active in the
+                    caller's shell are explicitly cleared by pgarchive. This must work without
+                    a password prompt, and the DB user must have sufficient privileges to
+                    create a connection slot.
+UPSTREAM_REPL       The connection info string the WAL archive process uses to fetch
+                    new WAL segments. Defaults to UPSTREAM + " user=replication".
+                    All of UPSTREAM's caveats apply.
+
+Container configuration file:
+
+\$PGARCHIVE/pgarchive.conf
+                    Contains some settings, primarily persisted upstream connection parameters,
+                    and a running counter for clone port numbers.
+                    This is sourced as a shell script, and could theoretically be used to override
+                    most internal variables and functions, at your own risk.
+
+EOF
+}
+
+bash_completion() {
+    cat <<'EOF'
+# pgarchive autocompletion for bash
+_pgarchive() {
+    local cur cmd subcmd cmds context
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    cmd=""
+    subcmd=""
+    [[ $COMP_CWORD -ge 2 ]] && cmd="${COMP_WORDS[1]}"
+    [[ $COMP_CWORD -ge 3 ]] && subcmd="${COMP_WORDS[2]}"
+
+    declare -A cmds
+    cmds["/"]="help container wal_archive standby snapshot clone"
+    cmds["container/"]="start stop status dashboard init init-cron purge"
+    cmds["wal_archive/"]="start stop status list log"
+    cmds["standby/"]="start stop status restart reload log"
+    cmds["snapshot/"]="create delete expire list"
+    cmds["snapshot/create"]="--force --no-force"
+    cmds["snapshot/delete"]="SNAPSHOT"
+    cmds["snapshot/expire"]="--show"
+    cmds["clone/"]="list create restore duplicate start stop status reload restart delete log psql"
+    cmds["clone/list"]="--status"
+    cmds["clone/create"]="SNAPSHOT"
+    cmds["clone/duplicate"]="CLONE"
+    cmds["clone/start"]="CLONE"
+    cmds["clone/stop"]="CLONE_OR_ALL"
+    cmds["clone/status"]="CLONE"
+    cmds["clone/reload"]="CLONE"
+    cmds["clone/restart"]="CLONE"
+    cmds["clone/delete"]="CLONE"
+    cmds["clone/log"]="CLONE"
+    cmds["clone/psql"]="CLONE"
+
+    context=${cmds["${cmd}"/"${subcmd}"]} || return 1
+    case "$context" in
+        SNAPSHOT)
+            COMPREPLY=($(compgen -W "`ls $PGARCHIVE/snapshots`" -- ${cur}))
+            ;;
+        CLONE)
+            COMPREPLY=($(compgen -W "`ls $PGARCHIVE/clones`" -- ${cur}))
+            ;;
+        CLONE_OR_ALL)
+            COMPREPLY=($(compgen -W "`ls $PGARCHIVE/clones` --all" -- ${cur}))
+            ;;
+        *)
+            COMPREPLY=($(compgen -W "${context}" -- ${cur}))
+            ;;
+    esac
+    return 0
+}
+complete -F _pgarchive pgarchive
+EOF
+}
+
+# For internal use only, by standby/recovery.conf.
+# This restore_command script can handle plain and gzipped files.
+# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
+standby_restore() {
+
+    wal="../wal_archive"
+    src="$wal/$1"
+    zsrc="${src}.gz"
+    dst="$2"
+
+    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
+
+    cp --reflink=always "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
+}
+
+# For internal use only, by standby/recovery.conf.
+# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
+# Note the $cleanup_position file is used by the wal_archive cronjob zipper, snapshotting,
+# and expiry.
+standby_record_cleanup_position() {
+
+    cleanup_position="pgarchive_cleanup_position"
+    restartpoint="$1"
+
+    # Note: This rm works around a quirk in our monitoring setup.
+    # Forced rm of $cleanup_position updates the standby directory's mtime,
+    # which is later frozen as snapshot and used by activity monitoring.
+    # It would be both simpler and better to monitor snapshot/.'s mtime directly.
+    rm -f "$cleanup_position"
+    echo "$restartpoint" > "$cleanup_position"
+}
+
+# For internal use only, by clones/*/recovery.conf.
+# This restore_command script can handle plain and gzipped files.
+# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
+clone_restore() {
+
+    wal="../../wal_archive"
+    src="$wal/$1"
+    zsrc="$wal/${1}.gz"
+    dst="$2"
+
+    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
+
+    cp --reflink=auto "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
+}
+
+container_init() {
+
+    log "Setting up backup location $container..."
+
+    btrfs subv create "$container"
+    btrfs subv create "$wal"
+    btrfs subv create "$standby"
+    mkdir "$log" "$snapshots" "$clones"
+    chmod 700 "$container" "$standby"
+    touch "$log/wal_archive.log"
+
+    upstream=${UPSTREAM:-""}
+    upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
+
+    cat >"$config" <<EOF
+
+# pgarchive container configuration
+
+# upstream DB parameters
+slot='$slot'
+upstream='$upstream'
+upstream_repl='$upstream_repl'
+
+# number of CPUs to use in the cron job "compress-wal-archive"
+compress_threads=1
+
+# snapshots are only created if the standby process has a restartpoint less than this minutes ago
+snapshot_max_restartpoint_minutes=65
+
+# snapshots and associated WAL segments are expired after this time (date (1) relative format)
+expire_date='4 weeks ago'
+
+# snapshots are thinned to 1 per day after this time
+thin_daily_date='2 weeks ago'
+
+# all pg_ctl invocations are passed a --timeout parameter with this value
+pg_ctl_timeout=900
+
+# next clone created will use this port, incremented automatically
+next_clone_port=54000
+EOF
+
+    log "."
+    log "Creating WAL archive at $wal..."
+    psql_upstream "select pg_create_physical_replication_slot('$slot');"
+    $0 wal_archive start
+    sleep 3
+
+    log "."
+    log "Creating warm standby..."
+    # Note: pg_basebackup sometimes exits non zero on mere warnings
+    # (e.g. "could not send feedback packet"). For this reason let's not be picky here,
+    # if something worse happened we'll find out soon enough.
+    pg_basebackup -D "$standby" --xlog-method=stream --progress -v -w -d "$upstream_repl" || true
+    rm -f "$standby/pg_log"/* "$standby/recovery.*"
+    mkdir "$standby/socket"
+    mv "$standby/pg_log" "$log/standby"
+    ln -s ../log/standby "$standby/pg_log"
+    mv "$standby/pg_xlog" "$log/standby_xlog"
+    ln -s ../log/standby_xlog "$standby/pg_xlog"
+
+    self="$(which $0)"
+    cat >"$standby/recovery.conf" <<EOF
+
+# recovery.conf for source of snapshot archive
+
+standby_mode = 'on'
+restore_command = '"$self" standby-restore %f %p'
+archive_cleanup_command = '"$self" standby-record-cleanup-position %r'
+
+recovery_target_timeline = 'latest'
+
+EOF
+
+    cat >>"$standby/postgresql.conf" <<EOF
+
+# @@@standby-config-start@@@
+# overrides for standby instance which is the source of the snapshots archive
+listen_addresses = ''
+port = 5432
+unix_socket_directories = 'socket'
+max_connections = 10
+shared_buffers = 1024MB
+checkpoint_segments = 16
+wal_keep_segments = 0
+synchronous_standby_names = ''
+hot_standby = off
+# @@@standby-config-end@@@
+
+EOF
+
+    log "."
+    sleep 10
+    $0 standby start
+    sleep 10
+    # Doing this earlier may cause clog problems:
+    # http://www.postgresql.org/message-id/20150621213916.GD4797@alap3.anarazel.de
+    rm -f "$standby/backup_label"*
+
+    log "."
+    container_init_cron
+
+    # The following shouldn't really be necessary, but when replicating from another slave
+    # sometimes the initial pg_basebackup isn't immediately consistent.
+    log "."
+    log "Waiting for a recoverable state for the initial snapshot."
+    log "You may abort this and create a snapshot later."
+    snapshot_wait_cleanup_position
+    snapshot_create
+}
+
+container_init_cron() {
+
+    log "Adding commented out cron jobs, you need to check and enable them using 'crontab -e'."
+    self="$(which $0)"
+    # "crontab -l" can fail if there is no crontab
+    ( crontab -l 2>/dev/null || true && cat <<EOF ) | crontab -
+
+# *** pgarchive instance at $container ***
+# compress WAL segments which have been processed by the standby process
+#*/7 * * * *        PGARCHIVE='$container' '$self' cron compress-wal-archive
+# expire old snapshots and associated WAL segments and create a new snapshot
+#01 */4 * * *       PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
+# defrag the standby directory
+#05 01 * * sun,wed  PGARCHIVE='$container' '$self' cron defrag-btrfs
+
+EOF
+}
+
+container_purge() {
+
+    set +e
+
+    log "removing replication slot $slot"
+    # if no $slot from config file fallback to $SLOT from environment
+    slot=${slot:-$SLOT}
+    psql_upstream "select pg_drop_replication_slot('$slot');"
+
+    log "deleting btrfs volumes"
+    btrfs subvolume delete --commit-after $wal $standby $snapshots/* $clones/* $container
+
+    log "please clean up the crontab yourself (crontab -e)"
+}
+
+snapshot_check_cleanup_position() {
+    at_most_minutes_ago="-$1"
+    [[ -n $(find $standby_cleanup_position -cmin $at_most_minutes_ago 2>/dev/null) ]] &&
+        seg=$(cat "$standby_cleanup_position" 2>/dev/null) &&
+        [[ -f "$wal/$seg" || -f "$wal/$seg.gz" ]]
+}
+
+snapshot_wait_cleanup_position() {
+
+    log "Waiting for a completed restartpoint."
+    while true; do
+        snapshot_check_cleanup_position 100 && break || true
+        echo -n .
+        sleep 10
+    done
+    echo ""
+}
+
+snapshot_create() {
+
+    date=`date +"$datefmt" --utc`
+    log "Creating snapshot $date."
+
+    # We'd like to create snapshots read-only, but this prevents deleting them without sudo,
+    # even if user_subvol_rm_allowed is used. I think that's a btrfs bug.
+    #btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
+
+    btrfs subvolume snapshot "$standby" "$snapshots/$date"
+}
+
+snapshot_expire() {
+
+    cutoff=$(date +"$datefmt" --utc --date="$expire_date")
+    maxwalcutoff="000000000000000000000000"
+    log "Expiring snapshots before $cutoff."
+    for s in $(cd "$snapshots" && ls -1); do
+        if [[ "$s" < "$cutoff" ]]; then
+            if [[ -f "$snapshots/$s/pgarchive_cleanup_position" ]]; then
+                walcutoff=$(<"$snapshots/$s/pgarchive_cleanup_position")
+                [[ "$walcutoff" > "$maxwalcutoff" ]] && maxwalcutoff="$walcutoff"
+            fi
+            do_or_show btrfs subvolume delete --commit-after "$snapshots/$s"
+        fi
+    done
+    if [[ "$maxwalcutoff" = "000000000000000000000000" ]]; then
+        log "No WAL segments to expire."
+    else
+        if [[ -n "$dry_run" ]]; then
+            log "Expiring related WAL segments before $maxwalcutoff (DRY RUN)."
+            pg_archivecleanup -n -x .gz "$wal" "$maxwalcutoff"
+            pg_archivecleanup -n -x .partial "$wal" "$maxwalcutoff"
+        else
+            log "Expiring related WAL segments before $maxwalcutoff."
+            pg_archivecleanup -x .gz "$wal" "$maxwalcutoff"
+            pg_archivecleanup -x .partial "$wal" "$maxwalcutoff"
+        fi
+    fi
+}
+
+snapshot_thin_daily() {
+
+    cutoff=$(date +"$datefmt" --utc --date="$thin_daily_date")
+    log "Thinning snapshots to 1/day before $cutoff."
+    curday=""
+    for s in $(cd "$snapshots" && ls -1); do
+        if [[ "$s" < "$cutoff" ]]; then
+            day=${s:0:10}
+            if [[ "$curday" = "$day" ]]; then
+                do_or_show btrfs subvolume delete --commit-after "$snapshots/$s"
+            else
+                curday=$day
+                debug "keeping $s as first of day"
+            fi
+        fi
+    done
+
+}
+
+clone_create() {
+
+    src="$snapshots/$1"
+    [[ -d "$src" ]] || fail "snapshot \"$1\" does not exist"
+
+    clone="$clones/$2"
+    [[ -z "$2" ]] && fail "clone name required"
+    [[ -e "$clone" ]] && fail "clone $2 already exists"
+
+    btrfs subvolume snapshot "$src" "$clone"
+    log "created from snapshot $1" > "$clone/pgarchive.log"
+
+    rm -rf "$clone/pg_log" "$clone/pg_xlog" "$clone/socket" "$clone"/postmaster.*
+    mkdir "$clone/pg_log" "$clone/pg_xlog"
+
+    [[ -n "$3" ]] \
+        && target="recovery_target_time = '$3'" \
+        || target="recovery_target = 'immediate'"
+    cat >"$clone/recovery.conf" <<EOF
+
+# recovery.conf for restoring a clone of a snapshot
+
+standby_mode = 'off'
+restore_command = '"$(which $0)" clone-restore %f %p'
+
+$target
+
+# alternatives
+#recovery_target = 'immediate'
+#recovery_target_time = 'TIME'
+#recovery_target_name = 'NAME'
+#recovery_target_xid = 'X'
+
+#recovery_target_inclusive = 'true'
+
+# If true, you need to "select pg_xlog_replay_resume()" to end recovery or kill to abort.
+# You also need to enable hot_standby in postgresql.conf for this.
+pause_at_recovery_target = false
+
+EOF
+
+    sed -i".snapshot" '/@@@standby-config-start@@@/,/@@standby-config-end@@@/d' "$clone/postgresql.conf"
+    cat >>"$clone/postgresql.conf" <<EOF
+
+# @@@clone-config-start@@@
+# default overrides for a clone, feel free to change them as needed
+listen_addresses = ''
+port = $next_clone_port
+shared_buffers = 2GB
+checkpoint_segments = 16
+synchronous_standby_names = ''
+wal_keep_segments = 0
+#autovacuum = off
+#fsync = off
+#synchronous_commit = off
+# @@@clone-config-end@@@
+
+EOF
+
+    incr_next_clone_port
+}
+
+clone_duplicate() {
+
+    dup="$clones/$1"
+    [[ -n "$1" ]] || fail "new clone name required"
+    [[ -e "$dup" ]] && fail "clone $1 already exists"
+
+    btrfs subvolume snapshot "$clone" "$dup"
+    rm -f "$dup"/postmaster.*
+    log "duplicated from clone $(basename $clone)" >> "$dup/pgarchive.log"
+
+    echo "# override port for duplicate" >>"$clone/postgresql.conf"
+    echo "port = $next_clone_port" >>"$clone/postgresql.conf"
+    echo "" >>"$clone/postgresql.conf"
+
+    incr_next_clone_port
+}
+
+
+### main
+
+cmd=$1
+shift || true
+
+case "$cmd" in
+    help|--help)
+        help
+        ;;
+
+    standby-restore)
+        standby_restore $@
+        ;;
+
+    standby-record-cleanup-position)
+        standby_record_cleanup_position $@
+        ;;
+
+    clone-restore)
+        clone_restore $@
+        ;;
+
+    bash-completion)
+        bash_completion
+        ;;
+
+    container)
+        subcmd=$1
+        shift || true
+
+        case "$subcmd" in
+            init)
+                # no configure here, as we don't have anything yet
+                set_container
+                setup
+                container_init
+                ;;
+
+            purge)
+                # no configure here either, configuration may be present or not
+                set_container
+                setup
+                [[ -f $config ]] && . $config
+
+                $0 wal_archive status >/dev/null 2>&1 && fail "wal_archive must be stopped"
+                $0 standby status >/dev/null 2>&1 && fail "standby must be stopped"
+                ($0 clone list --status | grep "server is running") >/dev/null 2>&1 && fail "all clones must be stopped"
+
+                if [[ "$1" = '--force' ]]; then
+                    log "Completely purging $container."
+                    log "Any errors are ignored and left to manual cleanup, or you may repeat this."
+                    container_purge
+                else
+                    log "If you really want to purge $container and remove upstream's $slot slot, provide --force."
+                    log "WARNING: this will delete EVERTHING under $container."
+                fi
+                ;;
+
+            disconnect)
+                # remove the replication slot & ?
+                fail "TODO"
+                ;;
+
+            *)
+                configure
+                ;;&
+
+            init-cron)
+                container_init_cron
+                ;;
+
+            status)
+                status=0
+                $0 wal_archive status || status=1
+                $0 standby status || status=1
+                exit $status
+                ;;
+
+            dashboard)
+                status=0
+                $0 wal_archive status || status=1
+                $0 standby status || status=1
+
+                set +e
+
+                echo ""
+                df -hP "$container"
+
+                echo ""
+                echo "Replication status at upstream:"
+                psql_upstream "select * from pg_stat_replication where application_name = '$slot'"
+
+                echo ""
+                tail -n 5 "$log"/*.log "$standbylog"
+
+                exit $status
+                ;;
+
+            start)
+                $0 wal_archive start || true
+                $0 standby start
+                ;;
+
+            stop)
+                $0 wal_archive stop || true
+                $0 standby stop
+                ;;
+
+            *)
+                fail "unknown container command"
+                ;;
+        esac
+        ;;
+
+    *)
+        configure
+        ;;&
+
+    wal_archive)
+        subcmd=$1
+        shift || true
+
+        curpid=`cat $walpid 2>/dev/null` || true
+        running() {
+            [[ -n "$curpid" && -d "/proc/$curpid" ]] &&
+                grep "pg_receivexlog.*--slot=$slot" "/proc/$curpid/cmdline" >/dev/null
+        }
+
+        case "$subcmd" in
+            status)
+                running \
+                    && log "wal_archive is running (pid=$curpid)" \
+                    || (log "wal_archive is not running" ; exit 1)
+                ;;
+
+            start)
+                running && fail "wal_archive is already running (pid=$curpid)"
+
+                log "starting wal_archive process $slot"
+                PGAPPNAME="$slot" \
+                    pg_receivexlog -D "$wal" --slot="$slot" -v -w -d "$upstream_repl" \
+                    >> "$log/wal_archive.log" 2>&1 &
+                echo $! > "$walpid"
+                ;;
+
+            stop)
+                running || fail "wal_archive is not running"
+
+                log "stopping wal_archive (pid=$curpid)"
+                kill "$curpid"
+                sleep 0.5
+                while [[ -d /proc/$curpid ]]; do
+                    echo -n "."
+                    sleep 1
+                done
+                echo ""
+                ;;
+
+            log)
+                show_log "$1" "$wallog"
+                ;;
+
+            list)
+                ls -l $wal
+                du -sh $wal
+                ;;
+
+            *)
+                fail "unknown wal_archive command"
+                ;;
+        esac
+        ;;
+
+    standby)
+        subcmd=$1
+        shift || true
+
+        case "$subcmd" in
+            log)
+                show_log "$1" "$standbylog"
+                ;;
+
+            start|stop|status|reload|restart)
+                pg_ctl_cmd "$standby" "$subcmd" $@
+                status=$?
+                [[ "$subcmd" = *start ]] && sleep 2
+                exit $status
+                ;;
+
+            *)
+                fail "unknown standby command"
+                ;;
+        esac
+        ;;
+
+    snapshot)
+        subcmd=$1
+        shift || true
+
+        case "$subcmd" in
+            list)
+                #sudo btrfs subvolume list $container | grep 'path snapshot/' | cut -d/ -f2
+                cd "$snapshots"
+                if [[ -n "$@" ]]; then
+                    ls -1d $@
+                else
+                    ls -1
+                fi
+                ;;
+
+            create)
+                if [[ "$1" = "--force" ]]; then
+                    snapshot_create
+                else
+                    pg_ctl_status "$standby" ||
+                        fail "No snapshot was created because the standby process is not running, start it or use --force."
+                    snapshot_check_cleanup_position $snapshot_max_restartpoint_minutes ||
+                        fail "No snapshot was created because the last restartpoint is more than $snapshot_max_restartpoint_minutes minutes old. Check your standby process."
+                    snapshot_create
+                fi
+                ;;
+
+            expire)
+                expire_date="${EXPIRE_DATE:-$expire_date}"
+                [[ -n "$expire_date" ]] || fail 'No $expire_date or $EXPIRE_DATE set.'
+                [[ "$1" = "--show" ]] && enable_dry_run
+                snapshot_expire
+                ;;
+
+            thin)
+                thin_daily_date="${THIN_DAILY_DATE:-$thin_daily_date}"
+                [[ -n "$thin_daily_date" ]] || fail 'No $thin_daily_date or $THIN_DAILY_DATE set.'
+                [[ "$1" = "--show" ]] && enable_dry_run
+                snapshot_thin_daily
+                ;;
+
+            delete)
+                btrfs subvolume delete --commit-after "$snapshots/$1"
+                ;;
+
+            *)
+                fail "unknown snapshot command"
+                ;;
+        esac
+        ;;
+
+    clone)
+        subcmd=$1
+        shift || true
+
+        case "$subcmd" in
+            list)
+                if [[ "$1" = "--status" ]]; then
+                    set +e
+                    for c in $(cd "$clones" && [[ -n "$2" ]] && ls -d $2 || ls) ; do
+                        port=$(grep '^port =' "$clones/$c"/postgresql.conf | tail -n1 | cut -d" " -f3)
+                        echo "*** $c (port=$port) ***"
+                        $0 clone status $c
+                    done
+                else
+                    cd "$clones"
+                    [[ -n "$1" ]] && ls -d $1 || ls
+                fi
+                ;;
+
+            create)
+                clone_create "$@"
+                log "Created new clone, recovery will be initiated once started."
+                log "You may edit postgresql.conf and recovery.conf if custom options are required."
+                ;;
+
+            *)
+                clone="$clones/$1"
+                [[ "$1" = "--all" ]] && all=1
+                [[ -n "$1" ]] || fail "clone name required"
+                [[ -d "$clone" ]] || [[ "$subcmd" = "stop" && -n "$all" ]] \
+                    || fail "clone $1 does not exist"
+                shift
+                ;;&
+
+            duplicate)
+                clone_duplicate "$@"
+                ;;
+
+            delete)
+                # Note this fails on purpose if the instance is running.
+                btrfs subvolume delete --commit-after "$clone"
+                ;;
+
+            log)
+                show_log "$1" "$clone/pg_log/postgresql-$(date +'%a').csv"
+                ;;
+
+            psql)
+                port=$(grep '^port =' "$clone"/postgresql.conf | tail -n1 | cut -d" " -f3)
+                if [[ ! -e $HOME/.psqlrc ]]; then
+                    log "Created a minimal .psqlrc to show \conninfo at startup."
+                    echo "\conninfo" > $HOME/.psqlrc
+                fi
+                psql -p $port "$@"
+                ;;
+
+            stop)
+                if [[ -n "$all" ]]; then
+                    for c in "$clones"/* ; do
+                        ! pg_ctl_status "$c" || pg_ctl_cmd "$c" stop $@
+                    done
+                else
+                    pg_ctl_cmd "$clone" stop $@
+                fi
+                ;;
+
+            start|status|reload|restart)
+                pg_ctl_cmd "$clone" "$subcmd" $@
+                status=$?
+                [[ "$subcmd" = *start ]] && sleep 2
+                exit $status
+                ;;
+
+            *)
+                fail "unknown clone command"
+                ;;
+        esac
+        ;;
+
+    cron)
+        subcmd=$1
+        shift || true
+
+        case "$subcmd" in
+            compress-wal-archive)
+                (
+                    flock --nonblock 1 || fail "Another compress-wal-archive is still running."
+                    cutoff=$(<$standby_cleanup_position)
+                    log "compress-wal-archive up to $cutoff"
+                    pg_archivecleanup -n "$wal" "$cutoff" | xargs -r -n 16 -P "$compress_threads" gzip -f
+                ) >>"$cron_wallog" 2>&1
+                ;;
+
+            expire-and-create-snapshot)
+                (
+                    flock --nonblock 1 || fail "Another expire-and-create-snapshot is still running."
+                    log "*** expire-and-create-snapshot ***"
+                    $0 snapshot expire || true
+                    $0 snapshot thin || true
+                    $0 snapshot create
+                ) >>"$cron_snapshotlog" 2>&1
+                ;;
+
+            defrag-btrfs)
+                (
+                    flock --nonblock 1 || fail "Another defrag-btrfs is still running."
+                    log sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
+                    time sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
+                ) >>"$cron_btrfslog" 2>&1
+                ;;
+
+            *)
+                fail "unknown cron command"
+                ;;
+        esac
+        ;;
+
+    *)
+        fail "unknown command, try 'help'"
+        ;;
+esac
+
