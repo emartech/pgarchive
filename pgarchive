@@ -408,7 +408,9 @@ EOF
     # Note: pg_basebackup sometimes exits non zero on mere warnings
     # (e.g. "could not send feedback packet"). For this reason let's not be picky here,
     # if something worse happened we'll find out soon enough.
-    pg_basebackup -D "$standby" --xlog-method=stream --progress -v -w -d "$upstream_repl" || true
+    PGAPPNAME="${slot}_basebackup" \
+        pg_basebackup -D "$standby" --xlog-method=stream --progress --verbose --no-password \
+        --label "$slot base backup" -d "$upstream_repl" || true
     rm -f "$standby/pg_log"/* "$standby/recovery.*"
     mkdir "$standby/socket"
     mv "$standby/pg_log" "$log/standby"
@@ -519,7 +521,9 @@ snapshot_wait_cleanup_position() {
 
 snapshot_create() {
 
-    date=`date +"$datefmt" --utc`
+    date=$(date +"$datefmt" --utc \
+        --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
+
     log "Creating snapshot $date."
 
     # We'd like to create snapshots read-only, but this prevents deleting them without sudo,
@@ -797,8 +801,8 @@ case "$cmd" in
 
                 log "starting wal_archive process $slot"
                 PGAPPNAME="$slot" \
-                    pg_receivexlog -D "$wal" --slot="$slot" -v -w -d "$upstream_repl" \
-                    >> "$log/wal_archive.log" 2>&1 &
+                    pg_receivexlog -D "$wal" --slot="$slot" --verbose --no-password \
+                    -d "$upstream_repl" >>"$log/wal_archive.log" 2>&1 &
                 echo $! > "$walpid"
                 ;;
 
