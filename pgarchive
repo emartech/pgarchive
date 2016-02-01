@@ -421,7 +421,7 @@ EOF
     self="$(which $0)"
     cat >"$standby/recovery.conf" <<EOF
 
-# recovery.conf for source of snapshot archive
+# recovery.conf for pgarchive's standby subsystem
 
 standby_mode = 'on'
 restore_command = '"$self" standby-restore %f %p'
@@ -476,12 +476,9 @@ container_init_cron() {
     ( crontab -l 2>/dev/null || true && cat <<EOF ) | crontab -
 
 # *** pgarchive instance at $container ***
-# compress WAL segments which have been processed by the standby process
-#*/7 * * * *        PGARCHIVE='$container' '$self' cron compress-wal-archive
-# expire old snapshots and associated WAL segments and create a new snapshot
-#01 */4 * * *       PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
-# defrag the standby directory
-#05 01 * * sun,wed  PGARCHIVE='$container' '$self' cron defrag-btrfs
+#*/7 * * * *            PGARCHIVE='$container' '$self' cron compress-wal-archive
+#01 */4 * * *           PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
+#05 01 * * sun          PGARCHIVE='$container' '$self' cron defrag-btrfs
 
 EOF
 }
@@ -523,14 +520,8 @@ snapshot_create() {
 
     date=$(date +"$datefmt" --utc \
         --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
-
     log "Creating snapshot $date."
-
-    # We'd like to create snapshots read-only, but this prevents deleting them without sudo,
-    # even if user_subvol_rm_allowed is used. I think that's a btrfs bug.
-    #btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
-
-    btrfs subvolume snapshot "$standby" "$snapshots/$date"
+    btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
 }
 
 snapshot_expire() {
@@ -544,7 +535,7 @@ snapshot_expire() {
                 walcutoff=$(<"$snapshots/$s/pgarchive_cleanup_position")
                 [[ "$walcutoff" > "$maxwalcutoff" ]] && maxwalcutoff="$walcutoff"
             fi
-            do_or_show btrfs subvolume delete --commit-after "$snapshots/$s"
+            do_or_show btrfs sudo subvolume delete --commit-after "$snapshots/$s"
         fi
     done
     if [[ "$maxwalcutoff" = "000000000000000000000000" ]]; then
@@ -898,7 +889,7 @@ case "$cmd" in
                 ;;
 
             delete)
-                btrfs subvolume delete --commit-after "$snapshots/$1"
+                sudo btrfs subvolume delete --commit-after "$snapshots/$1"
                 ;;
 
             *)

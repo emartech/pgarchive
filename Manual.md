@@ -2,7 +2,6 @@
 
 A PostgreSQL Archive Server providing fast and incremental Backup and Restore Services
 
-[TOC]
 
 ## Installation
 
