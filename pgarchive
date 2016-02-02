@@ -30,6 +30,7 @@ unset PGDATA
 
 datefmt='%Y-%m-%dT%R:%SZ'
 pg_ctl_timeout=900
+btrfs_commit='--commit-after'
 
 log() {
   echo `date +"$datefmt" --utc` "$*"
@@ -463,7 +464,6 @@ EOF
     # sometimes the initial pg_basebackup isn't immediately consistent.
     log "."
     log "Waiting for a recoverable state for the initial snapshot."
-    log "You may abort this and create a snapshot later."
     snapshot_wait_cleanup_position
     snapshot_create
 }
@@ -493,7 +493,10 @@ container_purge() {
     psql_upstream "select pg_drop_replication_slot('$slot');"
 
     log "deleting btrfs volumes"
-    btrfs subvolume delete --commit-after $wal $standby $snapshots/* $clones/* $container
+    for snapshot in "$snapshots"/* ; do
+        btrfs property set -t subvol "$snapshot" ro false
+    done
+    btrfs subvolume delete $btrfs_commit "$wal" "$standby" "$snapshots"/* "$clones"/* "$container"
 
     log "please clean up the crontab yourself (crontab -e)"
 }
@@ -518,8 +521,7 @@ snapshot_wait_cleanup_position() {
 
 snapshot_create() {
 
-    date=$(date +"$datefmt" --utc \
-        --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
+    date="$1"
     log "Creating snapshot $date."
     btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
 }
@@ -535,7 +537,8 @@ snapshot_expire() {
                 walcutoff=$(<"$snapshots/$s/pgarchive_cleanup_position")
                 [[ "$walcutoff" > "$maxwalcutoff" ]] && maxwalcutoff="$walcutoff"
             fi
-            do_or_show btrfs sudo subvolume delete --commit-after "$snapshots/$s"
+            btrfs property set -t subvol "$snapshots/$s" ro false
+            do_or_show btrfs subvolume delete $btrfs_commit "$snapshots/$s"
         fi
     done
     if [[ "$maxwalcutoff" = "000000000000000000000000" ]]; then
@@ -562,7 +565,7 @@ snapshot_thin_daily() {
         if [[ "$s" < "$cutoff" ]]; then
             day=${s:0:10}
             if [[ "$curday" = "$day" ]]; then
-                do_or_show btrfs subvolume delete --commit-after "$snapshots/$s"
+                do_or_show btrfs subvolume delete $btrfs_commit "$snapshots/$s"
             else
                 curday=$day
                 debug "keeping $s as first of day"
@@ -863,14 +866,26 @@ case "$cmd" in
                 ;;
 
             create)
+                date=$(date +"$datefmt" --utc \
+                    --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
+                [[ -e "$snapshots/$date" ]] && log "The snapshot $date already exists." && exit 0
+
                 if [[ "$1" = "--force" ]]; then
-                    snapshot_create
+                    snapshot_create "$date"
                 else
                     pg_ctl_status "$standby" ||
                         fail "No snapshot was created because the standby process is not running, start it or use --force."
                     snapshot_check_cleanup_position $snapshot_max_restartpoint_minutes ||
                         fail "No snapshot was created because the last restartpoint is more than $snapshot_max_restartpoint_minutes minutes old. Check your standby process."
-                    snapshot_create
+
+                    # We could snapshot while the standby is running, but this seems to kill
+                    # PG with ENOSPC (no matter the real free space) too often :-(
+                    # Note also we must not capture possibly flock'ed file descriptors if
+                    # called via "cron expire-and-create-snapshot".
+                    # At least this saves some time (crash recovery) at clone start.
+                    pg_ctl_cmd "$standby" stop >/dev/null 2>/dev/null
+                    snapshot_create "$date"
+                    pg_ctl_cmd "$standby" start >/dev/null 2>/dev/null
                 fi
                 ;;
 
@@ -889,7 +904,9 @@ case "$cmd" in
                 ;;
 
             delete)
-                sudo btrfs subvolume delete --commit-after "$snapshots/$1"
+                # btrfs doesn't allow users to delete ro subvolumes ever (bug?)
+                btrfs property set -t subvol "$snapshots/$1" ro false
+                btrfs subvolume delete $btrfs_commit "$snapshots/$1"
                 ;;
 
             *)
@@ -938,7 +955,7 @@ case "$cmd" in
 
             delete)
                 # Note this fails on purpose if the instance is running.
-                btrfs subvolume delete --commit-after "$clone"
+                btrfs subvolume delete $btrfs_commit "$clone"
                 ;;
 
             log)
