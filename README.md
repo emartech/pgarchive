@@ -53,7 +53,7 @@ It is used in production at emarsys.com to back up large (up to 1TB sizec, 100GB
 * opinionated
     * uses standard tools in a unique way
     * presumes some upstream configuration parameters, like CSV logging, and an available streaming replication connection and slot
-    * at the moment contains many hard coded configuration parameters in the script instead of in a configuratioin file
+    * at the moment contains many hard coded configuration parameters in the script instead of in a configuration file
 * requires PostgreSQL 9.4
     * due to its architecture and use of replication slots earlier versions are not easily supported
     * changes for 9.5 should be trivial and will be done soon
