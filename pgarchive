@@ -565,6 +565,7 @@ snapshot_thin_daily() {
         if [[ "$s" < "$cutoff" ]]; then
             day=${s:0:10}
             if [[ "$curday" = "$day" ]]; then
+                btrfs property set -t subvol "$snapshots/$s" ro false
                 do_or_show btrfs subvolume delete $btrfs_commit "$snapshots/$s"
             else
                 curday=$day
