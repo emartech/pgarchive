@@ -67,7 +67,7 @@ It is used in production at emarsys.com to back up large (up to 1TB sizec, 100GB
 
 ## About
 
-For more information please read the [manual](MANUAL.md).
+For more information please read the [manual](Manual.md).
 
 Created by Jürgen Strobel <juergen.strobel@emarsys.com> while working at [emarsys.com].
 
