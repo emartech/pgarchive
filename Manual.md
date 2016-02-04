@@ -6,8 +6,8 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 ## Installation
 
 1. You must have PostgreSQL 9.4 installed, including its client and server applications.
-1. You must have `btrfs` installed, from btrfs-progs.
-1. Copy `pgarchive` from this repository to /usr/local/bin or somewhere else in your path. Make sure it has +x permissions.
+1. You must have [btrfs] installed, from btrfs-progs.
+1. Copy `pgarchive` from this repository to `/usr/local/bin` or somewhere else in your path. Make sure it has `+x` permissions.
 1. Edit `pgarchive's` `export PATH=` line near the top so it can find the right (9.4) PostgreSQL applications and `btrfs`.
 
 If you want fancy bash completion to work you should execute the following, or better yet put it in a .bashrc or equivalent file:
@@ -22,7 +22,7 @@ All invocations of pgarchive require $PGARCHIVE to be the path to a backup conta
 export PGARCHIVE=/path/to/container
 ```
 
-For high-load DBs at emarsys.com the following btrfs mount options work best. You do need `user_subvol_rm_allowed` for snapshot expiry to work, the rest merely improve performance for us. See [btrfs mount options] for more details.
+For high-load DBs at [emarsys.com] the following [btrfs mount options] work best. You do need `user_subvol_rm_allowed` for snapshot expiry to work, the rest merely improve performance for us.
 
 ```
 user_subvol_rm_allowed,noatime,nobarrier,enospc_debug,nodatacow,metadata_ratio=6
@@ -40,13 +40,13 @@ There are no internal security mechanisms at all. Note especially:
 
 ### Monitoring Hints
 
-Backup services need monitoring. How exactly this is done is out of scope of pgarchive and determined by local policy, but here is what we found useful at emarsys.com, for each container:
+Backup services need monitoring. How exactly this is done is out of scope of pgarchive and determined by local policy, but here is what we found useful at [emarsys.com], for each container:
 
 * The wal_archive directory should have frequent activity (mtime). If your upstream DB has long idle periods setting [archive_timeout] will put a limit on this (like 1 hour). Typically the wal_archive subsystem is not running if this alert is raised, or otherwise cannot write to the wal_archive directory.
 
 * The snapshots directory should have frequent activity too, depending on the cron job for snapshot creation. Note snapshot creation only succeeds if the standby process is active, which means running and having a recent restartpoint, so this typically flags standby process problems.
 
-* You absolutely need to monitor the size of your upstream DB's $PGDATA/pg_xlog directory. But you already do this, don't you? If pgarchive containers cannot stream replication data, old WAL segments cannot be released there because it's held by the container's [replication slot][replication slots]. You may eventually need to decide to drop the replication slot, which will break synchronization with your container.
+* You absolutely need to monitor the size of your upstream DB's $PGDATA/pg_xlog directory. But you already do this, don't you? If offline pgarchive containers cannot stream replication data, old WAL segments cannot be released because they are held by container [replication slots]. You may eventually need to decide to drop the replication slot, which will break synchronization with your container.
 
 Of course you should monitor free disk space for your containers, and other common system parameters.It's probably less useful to check for the presence of [pg_receivexlog] and PostgreSQL standby processes, because it's hard to associate them with multiple containers easily, and this may miss certain problems if subsystems become stuck without dying fully.
 
@@ -146,7 +146,7 @@ container dashboard Show detailed status and tails of log files.
 wal_archive start   Start the wal_archive process. This process connects to the upstream DB
                     using the PostgreSQL's replication protocol, with the configured
                     replication slot, and stores retrieved WAL segments in the wal_archive
-                    directory. Implemented by using pg_receivexlog.
+                    directory. Implemented by using [pg_receivexlog].
 wal_archive stop    Stop the wal_archive process.
 wal_archive status  Check if the wal_archive process is running.
 wal_archive list    List wal_archive directory and size.
@@ -252,3 +252,13 @@ $PGARCHIVE/pgarchive.conf
                     This is sourced as a shell script, and could theoretically be used to override
                     most internal variables and functions, at your own risk.
 ```
+
+[archive_timeout]: http://www.postgresql.org/docs/9.4/static/runtime-config-wal.html#GUC-ARCHIVE-TIMEOUT
+[btrfs mount options]: https://btrfs.wiki.kernel.org/index.php/Mount_options
+[btrfs]: https://btrfs.wiki.kernel.org/index.php/Main_Page
+[emarsys.com]: http://emarsys.com/
+[pg_basebackup]: http://www.postgresql.org/docs/9.4/static/app-pgbasebackup.html
+[pg_receivexlog]: http://www.postgresql.org/docs/9.4/static/app-pgreceivexlog.html
+[recovery.conf]: http://www.postgresql.org/docs/9.4/static/recovery-config.html
+[replication slots]: http://www.postgresql.org/docs/9.4/static/warm-standby.html#STREAMING-REPLICATION-SLOTS
+
