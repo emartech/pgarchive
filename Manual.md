@@ -101,6 +101,50 @@ Finally snapshots may be "cloned" to separate directories by users. They are pro
 Note that there is no full disaster recovery support yet, at the moment it is left to the user to rsync a clone back to a production server, or do fancy stuff with streaming replication, or whatever works best in his environment. A knowledgeable user could also copy a snapshot to some replacement server dierctly, connect remotely to the container's wal_archive, and thereby skip creating a local clone. Whatever you do, it is not recommended to run a local clone as full production replacement (at least not for a longer than strictly necessary) because btrfs isn't up to this yet. Support for more scripted recovery options are planned for the future.
 
 
+## Anatomy of a Container
+
+Each container directory must be on a btrfs filesystem, and is created as a btrfs subvolume in its own right. Each backup directory works in isolation from other ones (apart from global resources like TCP ports) and has the following files and subdirectories, some of which are btrfs subvolumes too:
+
+<dl>
+<dt>pgarchive.conf</di>
+  <dd>Container settings, in shell format and sourced by pgarchive before executing commands.</dd>
+<dt>logs</dt>
+  <dd>Directory of container logs. Also contains standby's pg_log and pg_xlog directories -- although the latter aren't proper logs -- to avoid snapshotting them.</dd>
+<dt>wal_archive</dt>
+  <dd>WAL segements retrieved by streaming replication from the upstream DB.</dd>
+<dt>standby</dt>
+  <dd>A btrfs subvolume containing a PostgreSQL data dir for a warm-standby instance. Snapshots are created from this directory.</dd>
+<dt>snapshots</dt>
+  <dd>Each subdirectory here is a btrfs read-only snapshot of the standby directory, with a ISO 8601 timestamp as the name (always UTC).</dd>
+<dt>clones</dt>
+  <dd>Each subdirectory is a write-able btrfs subvolume created by snapshotting a snapshot yet again. The names of clones is user-determined.</dd>
+</dl>
+
+Each running container consists of 2 process groups, one a pg_receivexlog process maintaining the wal_archive, the other one a minimal PostgreSQL instance, like this:
+
+```
+$ ps xf
+ 4737 ?        S      0:01 pg_receivexlog -D /mnt/backup/<NAME>/wal_archive \
+                                     --slot=wal_archive_<NAME> -v -w -d  user=replication
+ 5542 ?        S      0:00 /usr/pgsql-9.4/bin/postgres -D /mnt/backup/<NAME>/standby
+ 5544 ?        Ss     0:01  \_ postgres: logger process
+ 5545 ?        Ss     0:10  \_ postgres: startup process   recovering 00000005000000480000005C
+ 5549 ?        Ss     0:00  \_ postgres: checkpointer process
+ 5550 ?        Ss     0:00  \_ postgres: writer process
+```
+
+These 2 process groups may be started and stopped independently of each other and the upstream database. They will catch up after extended breaks, and retry connecting to their upstream indefinitely should it be unavailable. Their logs should show any problems.
+
+For each container 3 cron jobs are added to the crontab of the user creating the container. All are disabled (commented out) by default, but you should verify and enable all 3 usually. There are some parameters in pgarchive.conf which further control the behavior of these.
+
+```
+# *** pgarchive instance at /mnt/backup/<NAME> ***
+#*/7 * * * *        PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron compress-wal-archive
+#01 */4 * * *       PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron expire-and-create-snapshot
+#05 01 * * sun      PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron defrag-btrfs
+```
+
+
 ## Operation
 
 TODO
