@@ -182,18 +182,19 @@ container purge [--force]
                     Tries to read PGARCHIVE's config, and falls back to the same
                     extra environment parameters init uses. Make sure nothing at all is needed
                     any more, and everything is stopped.
-container start     Start backup container, which consists of the wal_archive and standby processes.
+container start     Start backup container, which starts both wal_archive and standby processes.
 container stop      Stop backup container.
 container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
-container dashboard Show detailed status and tails of log files.
+container dashboard Show detailed status and tails of all log files.
 
 wal_archive start   Start the wal_archive process. This process connects to the upstream DB
                     using the PostgreSQL's replication protocol, with the configured
                     replication slot, and stores retrieved WAL segments in the wal_archive
-                    directory. Implemented by using [pg_receivexlog].
+                    directory. Implemented by using pg_receivexlog.
 wal_archive stop    Stop the wal_archive process.
 wal_archive status  Check if the wal_archive process is running.
 wal_archive list    List wal_archive directory and size.
+wal_archive du      Show disk usage per day and total (by segment mtime).
 wal_archive log [-f]
                     Write wal_archive.log to stdout or tail -f it.
                     If stdout is a terminal $PAGER is used to show it.
@@ -201,10 +202,10 @@ wal_archive log [-f]
 standby (start|stop|status|reload|restart) [arg] ...
                     The standby process is a warm standby PostgreSQL instance which pulls
                     completed segments from the wal_archive directory. This is a simple frontend
-                    to control it using pg_ctl.
+                    to control it using pg_ctl, and extra arguments are passed through.
 standby log [-f]    Write today's standby log to stdout or tail -f it.
                     If stdout is a terminal $PAGER is used to show it.
-                    Assumes the standard weekly log rotation and csv logging.
+                    Assumes the standard weekly log rotation and CSV logging in standby/pg_log.
 
 snapshot create [--force]
                     Create a new btrfs snapshot of the standby directory under snapshots/.
@@ -220,10 +221,14 @@ snapshot expire [--show]
                     The format of the date must be understood by date (1) --date=STRING,
                     and may be a relative term like "1 week ago".
                     With --show only show the actions to be taken, but don't delete anything.
+snapshot thin [--show]
+                    Delete snapshots older than $thin_daily_date which are not the first snapshot
+                    of a day. This allows to thin snapshot density for older data. Like expire
+                    this supports --show and overriding the config file with $THIN_DAILY_DATE.
 snapshot list [<pattern>]
                     List snapshots, optionally restricted to a simple globbing pattern.
 
-clone create <snapshot> <name> [<target-time>]
+clone create <name> <snapshot> [<target-time>]
                     Create a new named (PostgreSQL) clone instance from a snapshot.
                     A new port is assigned and appended to postgresql.conf.
                     The clone will have a recovery.conf suitable to do recovery to
@@ -256,11 +261,11 @@ cron compress-wal-archive <n>
                     processed by the standby process. Run n processes in parallel (default 1).
                     The log is written to log/cron_wal_archive.log.
 cron expire-and-create-snapshot
-                    Expire old snapshots and wal segments, and create a new snapshot.
+                    Expire old snapshots and wal segments, thin snapshots, and create a new one.
                     The log is written to log/cron_snapshot.log.
 cron defrag-btrfs   Defragment the standby directory, since PostgreSQL tends to cause a critical
                     amount of fragmentation fast. Requires password-less sudo privileges to call
-                    "/sbin/btrfs filesystem defrag *". The log is written to log/cron_btrfs.log.
+                    "/sbin/btrfs filesystem defrag ...". The log is written to log/cron_btrfs.log.
 
 bash-completion     Output a bash completion snippet for this utility.
                     This may be saved to global or personal profiles, or eval'ed directly:
@@ -278,12 +283,12 @@ SLOT                Create and use this replication slot at upstream. Defaults t
 UPSTREAM            A connection info string used when accessing the upstream DB in
                     command mode, for example when creating a SLOT or checking status. See
                     http://www.postgresql.org/docs/9.4/static/libpq-connect.html#LIBPQ-CONNSTRING.
-                    The default value is empty (local connection, default port, user, DB etc.)
+                    The default value is "" (local connection, default port, user, DB etc.)
                     This is persisted to the config file and may be edited there later.
-                    Note that the usual libpq environment settings (PG*) which are active in the
-                    caller's shell are explicitly unset, so this needs to provide enough
-                    parameters to work in isolation (e.g. by cron, or a different user
-                    shell) later.
+                    Note that common libpq environment settings (PG*) which are active in the
+                    caller's shell are explicitly cleared by pgarchive. This must work without
+                    a password prompt, and the DB user must have sufficient privileges to
+                    create a connection slot.
 UPSTREAM_REPL       The connection info string the WAL archive process uses to fetch
                     new WAL segments. Defaults to UPSTREAM + " user=replication".
                     All of UPSTREAM's caveats apply.
@@ -291,10 +296,10 @@ UPSTREAM_REPL       The connection info string the WAL archive process uses to f
 Container configuration file:
 
 $PGARCHIVE/pgarchive.conf
-                    Contains various settings, primarily persisted upstream connection parameters,
-                    and a running counter for clone port numbers.
-                    This is sourced as a shell script, and could theoretically be used to override
-                    most internal variables and functions, at your own risk.
+                    Contains container specific settings: Primarily persisted upstream connection
+                    parameters from init, and some more regarding expiry and for the cron jobs.
+                    This is sourced as a shell script just before commands are executed and could
+                    be used to override most internal variables and functions, at your own risk.
 ```
 
 [archive_timeout]: http://www.postgresql.org/docs/9.4/static/runtime-config-wal.html#GUC-ARCHIVE-TIMEOUT

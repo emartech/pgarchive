@@ -145,6 +145,7 @@ wal_archive start   Start the wal_archive process. This process connects to the 
 wal_archive stop    Stop the wal_archive process.
 wal_archive status  Check if the wal_archive process is running.
 wal_archive list    List wal_archive directory and size.
+wal_archive du      Show disk usage per day and total (by segment mtime).
 wal_archive log [-f]
                     Write wal_archive.log to stdout or tail -f it.
                     If stdout is a terminal \$PAGER is used to show it.
@@ -269,7 +270,7 @@ _pgarchive() {
     declare -A cmds
     cmds["/"]="help container wal_archive standby snapshot clone"
     cmds["container/"]="start stop status dashboard init init-cron purge"
-    cmds["wal_archive/"]="start stop status list log"
+    cmds["wal_archive/"]="start stop status list du log"
     cmds["standby/"]="start stop status restart reload log"
     cmds["snapshot/"]="create delete expire thin list"
     cmds["snapshot/create"]="--force --no-force"
@@ -839,9 +840,26 @@ case "$cmd" in
 
             list)
                 ls -l $wal
-                du -sh $wal
                 ;;
 
+            du)
+                awk_wal_size='
+                    $8 ~ /........................(.gz)?$/ { count[$7]++ ; size[$7] += $1 }
+                    END {
+                        printf "Date\t\tNumber\tMB\tCompression\n"
+                        asorti(count, sorted)
+                        n=length(sorted)
+                        for (i=1; i<=n; ++i) {
+                            d=sorted[i]
+                            c=count[d]
+                            s=size[d]/1024
+                            printf "%s\t%d\t%d\t%3.0f%%\n", d, c, s, 100-s/c/16*100
+                        }
+                    }'
+                echo "WAL segments in $wal:"
+                ls --size -k --time-style="+%Y-%m-%d" -l "$wal" | gawk "$awk_wal_size"
+                du -sh $wal
+                ;;
             *)
                 fail "unknown wal_archive command"
                 ;;
