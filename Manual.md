@@ -133,12 +133,12 @@ $ ps xf
  5550 ?        Ss     0:00  \_ postgres: writer process
 ```
 
-These 2 process groups may be started and stopped independently of each other and the upstream database. They will catch up after extended breaks, and retry connecting to their upstream indefinitely should it be unavailable. Their logs should show any problems.
+These 2 process groups may be started and stopped independently of each other (and even the upstream database) using the pgarchive wal_archive and standby command groups. They will catch up after extended breaks, and retry connecting to their upstream indefinitely should it be unavailable. Their logs should show any problems.
 
 For each container 3 cron jobs are added to the crontab of the user creating the container. All are disabled (commented out) by default, but you should verify and enable all 3 usually. There are some parameters in pgarchive.conf which further control the behavior of these.
 
 ```
-# *** pgarchive instance at /mnt/backup/<NAME> ***
+# *** pgarchive container /mnt/backup/<NAME> ***
 #*/7 * * * *        PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron compress-wal-archive
 #01 */4 * * *       PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron expire-and-create-snapshot
 #05 01 * * sun      PGARCHIVE='/mnt/backup/<NAME>' '/var/lib/pgsql/bin/pgarchive' cron defrag-btrfs
