@@ -178,7 +178,7 @@ snapshot thin [--show]
 snapshot list [<pattern>]
                     List snapshots, optionally restricted to a simple globbing pattern.
 
-clone create <snapshot> <name> [<target-time>]
+clone create <name> <snapshot> [<target-time>]
                     Create a new named (PostgreSQL) clone instance from a snapshot.
                     A new port is assigned and appended to postgresql.conf.
                     The clone will have a recovery.conf suitable to do recovery to
@@ -246,10 +246,10 @@ UPSTREAM_REPL       The connection info string the WAL archive process uses to f
 Container configuration file:
 
 \$PGARCHIVE/pgarchive.conf
-                    Contains some settings, primarily persisted upstream connection parameters,
-                    and a running counter for clone port numbers.
-                    This is sourced as a shell script, and could theoretically be used to override
-                    most internal variables and functions, at your own risk.
+                    Contains container specific settings: Primarily persisted upstream connection
+                    parameters from init, and some more regarding expiry and for the cron jobs.
+                    This is sourced as a shell script just before commands are executed and could
+                    be used to override most internal variables and functions, at your own risk.
 
 EOF
 }
@@ -277,7 +277,7 @@ _pgarchive() {
     cmds["snapshot/expire"]="--show"
     cmds["clone/"]="list create restore duplicate start stop status reload restart delete log psql"
     cmds["clone/list"]="--status"
-    cmds["clone/create"]="SNAPSHOT"
+    cmds["clone/create"]="CREATE_CLONE"
     cmds["clone/duplicate"]="CLONE"
     cmds["clone/start"]="CLONE"
     cmds["clone/stop"]="CLONE_OR_ALL"
@@ -298,6 +298,16 @@ _pgarchive() {
             ;;
         CLONE_OR_ALL)
             COMPREPLY=($(compgen -W "`ls $PGARCHIVE/clones` --all" -- ${cur}))
+            ;;
+        CREATE_CLONE)
+            case $COMP_CWORD in
+                4)
+                    COMPREPLY=($(compgen -W "`ls $PGARCHIVE/snapshots`" -- ${cur}))
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
             ;;
         *)
             COMPREPLY=($(compgen -W "${context}" -- ${cur}))
@@ -450,6 +460,10 @@ hot_standby = off
 EOF
 
     log "."
+    first_snapshot_fix_wal_archive
+    snapshot_create
+
+    log "."
     sleep 10
     $0 standby start
     sleep 10
@@ -459,13 +473,6 @@ EOF
 
     log "."
     container_init_cron
-
-    # The following shouldn't really be necessary, but when replicating from another slave
-    # sometimes the initial pg_basebackup isn't immediately consistent.
-    log "."
-    log "Waiting for a recoverable state for the initial snapshot."
-    snapshot_wait_cleanup_position
-    snapshot_create
 }
 
 container_init_cron() {
@@ -475,7 +482,7 @@ container_init_cron() {
     # "crontab -l" can fail if there is no crontab
     ( crontab -l 2>/dev/null || true && cat <<EOF ) | crontab -
 
-# *** pgarchive instance at $container ***
+# *** pgarchive container $container ***
 #*/7 * * * *            PGARCHIVE='$container' '$self' cron compress-wal-archive
 #01 */4 * * *           PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
 #05 01 * * sun          PGARCHIVE='$container' '$self' cron defrag-btrfs
@@ -508,20 +515,28 @@ snapshot_check_cleanup_position() {
         [[ -f "$wal/$seg" || -f "$wal/$seg.gz" ]]
 }
 
-snapshot_wait_cleanup_position() {
+first_snapshot_fix_wal_archive() {
 
-    log "Waiting for a completed restartpoint."
-    while true; do
-        snapshot_check_cleanup_position 100 && break || true
-        echo -n .
-        sleep 10
-    done
-    echo ""
+    # This is necessary because the standby's "REDO location" may be before the start
+    # of our wal_archive, and we do not snapshot the standby's pg_xlog directory.
+    log "Copying missing segments to wal_archive."
+    for s in $(cd "$standby/pg_xlog" && ls -1); do
+        if [[ -f "$wal/$s" || -f "$wal/$s.partial" ]]; then
+            break
+        else
+            cp "$standby/pg_xlog/$s" "$wal/$s"
+        fi
+    done;
+}
+
+snapshot_date() {
+    echo $(date +"$datefmt" --utc \
+        --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
 }
 
 snapshot_create() {
 
-    date="$1"
+    [[ -n "$1" ]] && date="$1" || date=$(snapshot_date)
     log "Creating snapshot $date."
     btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
 }
@@ -578,15 +593,15 @@ snapshot_thin_daily() {
 
 clone_create() {
 
-    src="$snapshots/$1"
-    [[ -d "$src" ]] || fail "snapshot \"$1\" does not exist"
+    [[ -z "$1" ]] && fail "clone name required"
+    clone="$clones/$1"
+    [[ -e "$clone" ]] && fail "$clone already exists"
 
-    clone="$clones/$2"
-    [[ -z "$2" ]] && fail "clone name required"
-    [[ -e "$clone" ]] && fail "clone $2 already exists"
+    src="$snapshots/$2"
+    [[ -d "$src" ]] || fail "$src does not exist"
 
     btrfs subvolume snapshot "$src" "$clone"
-    log "created from snapshot $1" > "$clone/pgarchive.log"
+    log "created from $src" > "$clone/pgarchive.log"
 
     rm -rf "$clone/pg_log" "$clone/pg_xlog" "$clone/socket" "$clone"/postmaster.*
     mkdir "$clone/pg_log" "$clone/pg_xlog"
@@ -634,6 +649,9 @@ wal_keep_segments = 0
 # @@@clone-config-end@@@
 
 EOF
+
+    log "Created new clone, recovery will be initiated once started."
+    log "You may edit postgresql.conf and recovery.conf if custom options are required."
 
     incr_next_clone_port
 }
@@ -867,8 +885,7 @@ case "$cmd" in
                 ;;
 
             create)
-                date=$(date +"$datefmt" --utc \
-                    --date="$(pg_controldata $standby | grep "latest checkpoint" | cut -d: -f2-)")
+                date=$(snapshot_date)
                 [[ -e "$snapshots/$date" ]] && log "The snapshot $date already exists." && exit 0
 
                 if [[ "$1" = "--force" ]]; then
@@ -885,7 +902,7 @@ case "$cmd" in
                     # called via "cron expire-and-create-snapshot".
                     # At least this saves some time (crash recovery) at clone start.
                     pg_ctl_cmd "$standby" stop >/dev/null 2>/dev/null
-                    snapshot_create "$date"
+                    snapshot_create
                     pg_ctl_cmd "$standby" start >/dev/null 2>/dev/null
                 fi
                 ;;
@@ -937,8 +954,6 @@ case "$cmd" in
 
             create)
                 clone_create "$@"
-                log "Created new clone, recovery will be initiated once started."
-                log "You may edit postgresql.conf and recovery.conf if custom options are required."
                 ;;
 
             *)
@@ -1003,9 +1018,13 @@ case "$cmd" in
             compress-wal-archive)
                 (
                     flock --nonblock 1 || fail "Another compress-wal-archive is still running."
-                    cutoff=$(<$standby_cleanup_position)
-                    log "compress-wal-archive up to $cutoff"
-                    pg_archivecleanup -n "$wal" "$cutoff" | xargs -r -n 16 -P "$compress_threads" gzip -f
+                    if [[ -f $standby_cleanup_position ]] ; then
+                        cutoff=$(<$standby_cleanup_position)
+                        log "compress-wal-archive up to $cutoff"
+                        pg_archivecleanup -n "$wal" "$cutoff" | xargs -r -n 16 -P "$compress_threads" gzip -f
+                    else
+                        log "No $standby_cleanup_position (this is normal for new containers only)."
+                    fi
                 ) >>"$cron_wallog" 2>&1
                 ;;
 
