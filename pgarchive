@@ -857,7 +857,8 @@ case "$cmd" in
                         }
                     }'
                 echo "WAL segments in $wal:"
-                ls --size -k --time-style="+%Y-%m-%d" -l "$wal" | gawk "$awk_wal_size"
+                ls --sort=none --size --kibibytes --time-style="+%Y-%m-%d" -l "$wal" \
+                    | gawk "$awk_wal_size"
                 du -sh $wal
                 ;;
             *)
