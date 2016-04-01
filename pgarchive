@@ -29,7 +29,7 @@ unset PGDATA
 ### internal utils
 
 datefmt='%Y-%m-%dT%R:%SZ'
-pg_ctl_timeout=900
+pg_ctl_timeout=3600
 btrfs_commit='--commit-after'
 
 log() {
@@ -404,7 +404,7 @@ expire_date='4 weeks ago'
 thin_daily_date='2 weeks ago'
 
 # all pg_ctl invocations are passed a --timeout parameter with this value
-pg_ctl_timeout=900
+pg_ctl_timeout=3600
 
 # next clone created will use this port, incremented automatically
 next_clone_port=54000
