@@ -14,8 +14,7 @@
 # abort on all errors
 set -e
 
-# set safe PATH and default PAGER
-export PATH=/usr/pgsql-9.4/bin:/sbin:/usr/sbin:/usr/bin:/bin
+# default PAGER
 export PAGER=${PAGER:-less}
 
 # clear out incidential libpq settings
@@ -24,6 +23,107 @@ unset PGSERVICE PGSERVICEFILE PGREALM PGOPTIONS PGAPPNAME
 unset PGSSLMODE PGREQUIRESSL PGSSLCOMPRESSION PGSSLCERT PGSSLKEY PGSSLROOTCERT
 unset PGSSLCRL PGREQUIREPEER PGKRBSRVNAME PGGSSLIB PGCONNECT_TIMEOUT PGCLIENTENCODING
 unset PGDATA
+
+
+### global config, eventually to be moved out to /etc/pgarchive.conf (very incomplete)
+
+# added to postgresql.conf for the standby process
+standby_postgresql_conf_9_4="\
+listen_addresses = ''
+port = 5432
+unix_socket_directories = 'socket'
+max_connections = 10
+shared_buffers = 1024MB
+checkpoint_segments = 16
+wal_keep_segments = 0
+synchronous_standby_names = ''
+hot_standby = off
+"
+
+standby_postgresql_conf_9_5="\
+listen_addresses = ''
+port = 5432
+unix_socket_directories = 'socket'
+max_connections = 10
+shared_buffers = 1024MB
+max_wal_size = 1GB
+min_wal_size = 80MB
+wal_keep_segments = 0
+synchronous_standby_names = ''
+hot_standby = off
+"
+
+# template for standby's recovery.conf, __PGARCHIVE__ will be replaced by $0
+standby_recovery_conf="\
+standby_mode = 'on'
+restore_command = '__PGARCHIVE__ standby-restore %f %p'
+archive_cleanup_command = '__PGARCHIVE__ standby-record-cleanup-position %r'
+recovery_target_timeline = 'latest'
+"
+
+# added to postgresql.conf for clones
+clone_postgresql_conf_9_4="\
+listen_addresses = ''
+shared_buffers = 2GB
+checkpoint_segments = 16
+synchronous_standby_names = ''
+wal_keep_segments = 0
+#autovacuum = off
+#fsync = off
+#synchronous_commit = off
+"
+
+clone_postgresql_conf_9_5="\
+listen_addresses = ''
+shared_buffers = 2GB
+max_wal_size = 1GB
+min_wal_size = 80MB
+synchronous_standby_names = ''
+wal_keep_segments = 0
+#autovacuum = off
+#fsync = off
+#synchronous_commit = off
+"
+
+# template for clones' recovery.conf, __PGARCHIVE__ and __TARGET__ will be interpolated
+clone_recovery_conf_9_4="\
+standby_mode = 'off'
+restore_command = '__PGARCHIVE__ clone-restore %f %p'
+
+__TARGET__
+
+# alternative recovery targets
+#recovery_target = 'immediate'
+#recovery_target_time = 'TIME'
+#recovery_target_name = 'NAME'
+#recovery_target_xid = 'X'
+
+#recovery_target_inclusive = 'true'
+
+# If true, commit with 'select pg_xlog_replay_resume()' or kill to abort.
+# See http://www.postgresql.org/docs/9.4/static/recovery-target-settings.html.
+pause_at_recovery_target = false
+"
+
+clone_recovery_conf_9_5="\
+standby_mode = 'off'
+restore_command = '__PGARCHIVE__ clone-restore %f %p'
+
+__TARGET__
+
+# alternative recovery targets
+#recovery_target = 'immediate'
+#recovery_target_time = 'TIME'
+#recovery_target_name = 'NAME'
+#recovery_target_xid = 'X'
+
+#recovery_target_inclusive = 'true'
+
+# Select one of pause, promote, shutdown.
+# When using pause, commit with 'select pg_xlog_replay_resume()' or kill to abort.
+# See http://www.postgresql.org/docs/9.5/static/recovery-target-settings.html.
+recovery_target_action = promote
+"
 
 
 ### internal utils
@@ -50,6 +150,7 @@ configure() {
     [[ -d "$container" ]] || fail "$PGARCHIVE does not exist."
     setup
     . $config
+    export PATH="$path"
 }
 
 set_container() {
@@ -80,6 +181,11 @@ psql_upstream() {
     psql -d "$upstream" -c "$1"
 }
 
+get_upstream_version() {
+    psql -qtA -d "$upstream" -c \
+       "select string_agg(n, '.') from (select unnest(regexp_matches(version(), E'PostgreSQL "'(\\d+)\\.(\\d+)'"'))) v(n)"
+}
+
 pg_ctl_cmd() {
     pgd=$1
     cmd=$2
@@ -91,10 +197,11 @@ pg_ctl_status() {
     pg_ctl_cmd $1 status >/dev/null 2>&1
 }
 
-incr_next_clone_port() {
-
-    next_clone_port=$((next_clone_port + 1))
-    sed -i".bak" 's/^next_clone_port=.*$'"/next_clone_port=$next_clone_port/" "$config"
+new_clone_port() {
+    lastport=$(cat $log/last_clone_port 2>/dev/null) || lastport=$((54000 + $RANDOM % 700))
+    newport=$(($lastport + 1))
+    echo $newport > "$log/last_clone_port"
+    echo $newport
 }
 
 show_log() {
@@ -111,6 +218,11 @@ enable_dry_run() {
     }
 }
 
+versioned_var() {
+    v="$1_$(echo $upstream_version | sed 's/\./_/')"
+    # either $$v or $$1 must be empty, so don't mix versioned and unversioned
+    eval "echo \"\$${v}\$$1\""
+}
 
 ### longer & complex commands
 
@@ -126,8 +238,6 @@ container init      Create a new container and upstream replication slot, both o
                     must not exist yet. This requires additional environment variables to be set,
                     see below. The new backup container is fully started and operational at the end,
                     except you need to verify and enable the cron jobs (crontab -e).
-container init-cron Add a new default cron stanza to the calling user's crontab, in case word in
-                    case you messed up the original.
 container purge [--force]
                     Completely remove the full backup location and the replication slot.
                     Tries to read PGARCHIVE's config, and falls back to the same
@@ -137,6 +247,9 @@ container start     Start backup container, which starts both wal_archive and st
 container stop      Stop backup container.
 container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
 container dashboard Show detailed status and tails of all log files.
+container initcron  Add default cron entries to the calling user's crontab, all jobs disabled.
+container checkversions
+                    Check versions of upstream DB and local PostgreSQL tools.
 
 wal_archive start   Start the wal_archive process. This process connects to the upstream DB
                     using the PostgreSQL's replication protocol, with the configured
@@ -222,13 +335,16 @@ bash-completion     Output a bash completion snippet for this utility.
                     This may be saved to global or personal profiles, or eval'ed directly:
                         eval "\$(pgarchive bash-completion)"
 
-Required Environment:
+Required Environment for all commands:
 
 PGARCHIVE           Base path to a backup container, which must be on btrfs.
 
-Extra environment parameters only used by 'container init' and 'purge' commands (settings are
-persisted to \$PGARCHIVE/pgarchive.conf):
+Extra environment parameters are used by the 'container init' and 'purge' commands.
+All of these settings here are persisted to the $PGARCHIVE/pgarchive.conf config file:
 
+PATH                The PATH used internally. This must contain PostgreSQL's server applications
+                    (pg_ctl, pg_basebackup, ...) of the same version as the DB a container
+                    is created for.
 SLOT                Create and use this replication slot at upstream. Defaults to
                     "pgarchive_<basename of \$PGARCHIVE>".
 UPSTREAM            A connection info string used when accessing the upstream DB in
@@ -247,8 +363,8 @@ UPSTREAM_REPL       The connection info string the WAL archive process uses to f
 Container configuration file:
 
 \$PGARCHIVE/pgarchive.conf
-                    Contains container specific settings: Primarily persisted upstream connection
-                    parameters from init, and some more regarding expiry and for the cron jobs.
+                    Contains container specific settings, primarily those above and some
+                    extra parameters regarding expiry and other cron jobs.
                     This is sourced as a shell script just before commands are executed and could
                     be used to override most internal variables and functions, at your own risk.
 
@@ -269,7 +385,7 @@ _pgarchive() {
 
     declare -A cmds
     cmds["/"]="help container wal_archive standby snapshot clone"
-    cmds["container/"]="start stop status dashboard init init-cron purge"
+    cmds["container/"]="start stop status dashboard init initcron purge checkversions"
     cmds["wal_archive/"]="start stop status list du log"
     cmds["standby/"]="start stop status restart reload log"
     cmds["snapshot/"]="create delete expire thin list"
@@ -370,45 +486,20 @@ clone_restore() {
 
 container_init() {
 
-    log "Setting up backup location $container..."
+    upstream=${UPSTREAM:-""}
+    upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
 
+    get_and_check_upstream_version
+    check_server_apps $upstream_version
+
+    log "."
+    log "Setting up backup location $container..."
     btrfs subv create "$container"
     btrfs subv create "$wal"
     btrfs subv create "$standby"
     mkdir "$log" "$snapshots" "$clones"
     chmod 700 "$container" "$standby"
-    touch "$log/wal_archive.log"
-
-    upstream=${UPSTREAM:-""}
-    upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
-
-    cat >"$config" <<EOF
-
-# pgarchive container configuration
-
-# upstream DB parameters
-slot='$slot'
-upstream='$upstream'
-upstream_repl='$upstream_repl'
-
-# number of CPUs to use in the cron job "compress-wal-archive"
-compress_threads=1
-
-# snapshots are only created if the standby process has a restartpoint less than this minutes ago
-snapshot_max_restartpoint_minutes=65
-
-# snapshots and associated WAL segments are expired after this time (date (1) relative format)
-expire_date='4 weeks ago'
-
-# snapshots are thinned to 1 per day after this time
-thin_daily_date='2 weeks ago'
-
-# all pg_ctl invocations are passed a --timeout parameter with this value
-pg_ctl_timeout=3600
-
-# next clone created will use this port, incremented automatically
-next_clone_port=54000
-EOF
+    create_own_conf
 
     log "."
     log "Creating WAL archive at $wal..."
@@ -430,43 +521,14 @@ EOF
     ln -s ../log/standby "$standby/pg_log"
     mv "$standby/pg_xlog" "$log/standby_xlog"
     ln -s ../log/standby_xlog "$standby/pg_xlog"
-
-    self="$(which $0)"
-    cat >"$standby/recovery.conf" <<EOF
-
-# recovery.conf for pgarchive's standby subsystem
-
-standby_mode = 'on'
-restore_command = '"$self" standby-restore %f %p'
-archive_cleanup_command = '"$self" standby-record-cleanup-position %r'
-
-recovery_target_timeline = 'latest'
-
-EOF
-
-    cat >>"$standby/postgresql.conf" <<EOF
-
-# @@@standby-config-start@@@
-# overrides for standby instance which is the source of the snapshots archive
-listen_addresses = ''
-port = 5432
-unix_socket_directories = 'socket'
-max_connections = 10
-shared_buffers = 1024MB
-checkpoint_segments = 16
-wal_keep_segments = 0
-synchronous_standby_names = ''
-hot_standby = off
-# @@@standby-config-end@@@
-
-EOF
+    create_standby_conf
 
     log "."
     first_snapshot_fix_wal_archive
     snapshot_create
 
     log "."
-    sleep 10
+    sleep 2
     $0 standby start
     sleep 10
     # Doing this earlier may cause clog problems:
@@ -474,10 +536,65 @@ EOF
     rm -f "$standby/backup_label"*
 
     log "."
-    container_init_cron
+    init_cron
 }
 
-container_init_cron() {
+create_own_conf() {
+
+    cat >"$config" <<EOF
+
+# pgarchive container configuration
+
+# upstream DB parameters
+slot='$slot'
+upstream='$upstream'
+upstream_repl='$upstream_repl'
+upstream_version='$upstream_version'
+
+# path to all used applications, must contain PostgreSQL server applications of the same
+# version as the upstream database, btrfs, and commonly used shell utilities
+path='$PATH'
+
+# number of CPUs to use in the cron job "compress-wal-archive"
+compress_threads=1
+
+# snapshots are only created if the standby process has a restartpoint less than this minutes ago
+snapshot_max_restartpoint_minutes=65
+
+# snapshots and associated WAL segments are expired after this time (date (1) relative format)
+expire_date='4 weeks ago'
+
+# snapshots are thinned to 1 per day after this time
+thin_daily_date='2 weeks ago'
+
+# all pg_ctl invocations are passed a --timeout parameter with this value
+pg_ctl_timeout=3600
+EOF
+}
+
+create_standby_conf() {
+
+    self="$(which $0)"
+    tmpl=$(versioned_var standby_recovery_conf)
+    cat >"$standby/recovery.conf" <<EOF
+
+# recovery.conf for pgarchive's standby subsystem
+
+${tmpl//__PGARCHIVE__/$self}
+
+EOF
+
+    cat >>"$standby/postgresql.conf" <<EOF
+
+# @@@standby-config-start@@@
+# overrides for standby instance which is the source of the snapshots archive
+$(versioned_var standby_postgresql_conf)
+# @@@standby-config-end@@@
+
+EOF
+}
+
+init_cron() {
 
     log "Adding commented out cron jobs, you need to check and enable them using 'crontab -e'."
     self="$(which $0)"
@@ -485,11 +602,35 @@ container_init_cron() {
     ( crontab -l 2>/dev/null || true && cat <<EOF ) | crontab -
 
 # *** pgarchive container $container ***
-#*/7 * * * *            PGARCHIVE='$container' '$self' cron compress-wal-archive
+#*/5 * * * *            PGARCHIVE='$container' '$self' cron compress-wal-archive
 #01 */4 * * *           PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
 #05 01 * * sun          PGARCHIVE='$container' '$self' cron defrag-btrfs
 
 EOF
+}
+
+get_and_check_upstream_version() {
+
+    upstream_version=$(get_upstream_version)
+    log "Detected upstream is PostgreSQL version $upstream_version."
+    case $upstream_version in
+        '9.4')
+            ;;
+        '9.5')
+            ;;
+        *)
+            fail "upstream version $upstream_version is not supported"
+            ;;
+    esac
+}
+
+check_server_apps() {
+    expected=$1
+    for app in pg_ctl pg_receivexlog pg_basebackup pg_archivecleanup pg_controldata ; do
+        $app --version | grep "$expected" > /dev/null || \
+            fail "$app is for a wrong version, correct your \$PATH and/or install the correct version"
+    done
+    log "Verified PostgreSQL server applications' versions."
 }
 
 container_purge() {
@@ -520,7 +661,7 @@ snapshot_check_cleanup_position() {
 first_snapshot_fix_wal_archive() {
 
     # This is necessary because the standby's "REDO location" may be before the start
-    # of our wal_archive, and we do not snapshot the standby's pg_xlog directory.
+    # of our wal_archive, and we do not include the standby's pg_xlog directoryin snapshots.
     log "Copying missing segments to wal_archive."
     for s in $(cd "$standby/pg_xlog" && ls -1); do
         if [[ -f "$wal/$s" || -f "$wal/$s.partial" ]]; then
@@ -528,7 +669,7 @@ first_snapshot_fix_wal_archive() {
         else
             cp "$standby/pg_xlog/$s" "$wal/$s"
         fi
-    done;
+    done
 }
 
 snapshot_date() {
@@ -608,30 +749,18 @@ clone_create() {
     rm -rf "$clone/pg_log" "$clone/pg_xlog" "$clone/socket" "$clone"/postmaster.*
     mkdir "$clone/pg_log" "$clone/pg_xlog"
 
+    tmpl="$(versioned_var clone_recovery_conf)"
+    self="$(which $0)"
+    tmpl="${tmpl//__PGARCHIVE__/$self}"
     [[ -n "$3" ]] \
         && target="recovery_target_time = '$3'" \
         || target="recovery_target = 'immediate'"
+    tmpl="${tmpl//__TARGET__/$target}"
     cat >"$clone/recovery.conf" <<EOF
 
-# recovery.conf for restoring a clone of a snapshot
+# recovery.conf for activating a clone of a snapshot
 
-standby_mode = 'off'
-restore_command = '"$(which $0)" clone-restore %f %p'
-
-$target
-
-# alternatives
-#recovery_target = 'immediate'
-#recovery_target_time = 'TIME'
-#recovery_target_name = 'NAME'
-#recovery_target_xid = 'X'
-
-#recovery_target_inclusive = 'true'
-
-# If true, you need to "select pg_xlog_replay_resume()" to end recovery or kill to abort.
-# You also need to enable hot_standby in postgresql.conf for this.
-pause_at_recovery_target = false
-
+${tmpl}
 EOF
 
     sed -i".snapshot" '/@@@standby-config-start@@@/,/@@standby-config-end@@@/d' "$clone/postgresql.conf"
@@ -639,23 +768,14 @@ EOF
 
 # @@@clone-config-start@@@
 # default overrides for a clone, feel free to change them as needed
-listen_addresses = ''
-port = $next_clone_port
-shared_buffers = 2GB
-checkpoint_segments = 16
-synchronous_standby_names = ''
-wal_keep_segments = 0
-#autovacuum = off
-#fsync = off
-#synchronous_commit = off
+port = $(new_clone_port)
+$(versioned_var clone_postgresql_conf)
 # @@@clone-config-end@@@
 
 EOF
 
     log "Created new clone, recovery will be initiated once started."
-    log "You may edit postgresql.conf and recovery.conf if custom options are required."
-
-    incr_next_clone_port
+    log "You may edit postgresql.conf and recovery.conf if custom options are desired."
 }
 
 clone_duplicate() {
@@ -669,10 +789,8 @@ clone_duplicate() {
     log "duplicated from clone $(basename $clone)" >> "$dup/pgarchive.log"
 
     echo "# override port for duplicate" >>"$clone/postgresql.conf"
-    echo "port = $next_clone_port" >>"$clone/postgresql.conf"
+    echo "port = $(new_clone_port)" >>"$clone/postgresql.conf"
     echo "" >>"$clone/postgresql.conf"
-
-    incr_next_clone_port
 }
 
 
@@ -682,6 +800,7 @@ cmd=$1
 shift || true
 
 case "$cmd" in
+
     help|--help)
         help
         ;;
@@ -743,8 +862,8 @@ case "$cmd" in
                 configure
                 ;;&
 
-            init-cron)
-                container_init_cron
+            initcron)
+                init_cron
                 ;;
 
             status)
@@ -782,6 +901,20 @@ case "$cmd" in
             stop)
                 $0 wal_archive stop || true
                 $0 standby stop
+                ;;
+
+            checkversions)
+                failed=""
+                current_upstream_version=$(get_upstream_version)
+                if [[ "$current_upstream_version" != "$upstream_version" ]]; then
+                    log "Upstream is version $current_upstream_version instead of expected $upstream_version."
+                    log "If upstream has been upgraded you have to create a new container to archive it, and you should retire this one."
+                    failed="y"
+                else
+                    log "Upstream version $upstream_version matches expectation."
+                fi
+                check_server_apps $upstream_version || failed="y"
+                [[ -n "$failed" ]] && exit 1
                 ;;
 
             *)
@@ -861,6 +994,7 @@ case "$cmd" in
                     | gawk "$awk_wal_size"
                 du -sh $wal
                 ;;
+
             *)
                 fail "unknown wal_archive command"
                 ;;
@@ -1076,4 +1210,3 @@ case "$cmd" in
         fail "unknown command, try 'help'"
         ;;
 esac
-
