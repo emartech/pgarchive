@@ -6,7 +6,7 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 ## Architecture
 
-## Overview
+### Overview
 
 `pgarchive` uses the concept of having a container to both store data and manage services for a PostgreSQL cluster. There may be several independant containers per host, and a database cluster may be backed up to serveral containers. The basic components and data flow for a single container are sketched in the following diagram. Some details like automatic expiry and btrfs filesystem maintenance are omitted for clarity.
 
@@ -152,7 +152,7 @@ Of course you should monitor free disk space for your containers, and other comm
 
 ## Basic Operation
 
-`pgarchive` is a command line utility. It is intended to be used by the postgres user, and it contains in-built `help` command which outputs a summary of all (public) commands. See the Command Reference below.
+`pgarchive` is a command line utility. It is intended to be used by the postgres user, and it contains a built in `help` command which outputs a summary of all (public) commands. See the Command Reference below.
 
 All invocations of pgarchive (except some internal ones) require PGARCHIVE to be set in your enviroment. For most commands it needs to point to an existing container directory, except for the `container init` command, which creates this directory. For convenience it is practical to set PGARCHIVE in `.bashrc` or a similar file, as described under Installation.
 
@@ -214,39 +214,61 @@ There are `start` and `stop` commands which do the expected. As promised there's
 
 ```
 $ pgarchive container dashboard
-2016-04-04T16:27:51Z wal_archive is running (pid=25821)
-pg_ctl: server is running (PID: 25780)
-/usr/pgsql-9.5/bin/postgres "-D" "/mnt/backup/t2/standby"
+2016-04-06T14:24:46Z wal_archive is running (pid=20786)
+pg_ctl: server is running (PID: 20796)
+/usr/pgsql-9.5/bin/postgres "-D" "/mnt/backup/t1/standby"
 
 Filesystem      Size  Used Avail Use% Mounted on
--               6.6T  5.2T  1.4T  80% /mnt/backup/t2
+-               6.6T  5.3T  1.3T  81% /mnt/backup/t1
 
-Replication status at upstream:
-  pid  | usesysid |   usename   | application_name | client_addr | client_hostname | client_port |         backend_start         | backend_xmin |   state   | sent_location | write_location | flush_location | replay_location | sync_priority | sync_state
--------+----------+-------------+------------------+-------------+-----------------+-------------+-------------------------------+--------------+-----------+---------------+----------------+----------------+-----------------+---------------+------------
- 25823 |    16385 | replication | pgarchive_t2     |             |                 |          -1 | 2016-04-04 14:32:33.616647+02 |              | streaming | 0/1A0004C0    | 0/1A0004C0     | 0/1A000000     |                 |             0 | async
-(1 row)
+Processes:
+  PID TTY      STAT   TIME COMMAND
+20796 pts/2    S      0:00 /usr/pgsql-9.5/bin/postgres -D /mnt/backup/t1/standby
+20804 ?        Ss     0:00  \_ postgres: logger process
+20805 ?        Ss     0:00  \_ postgres: startup process   recovering 00000001000000000000004C
+20812 ?        Ss     0:00  \_ postgres: checkpointer process
+20814 ?        Ss     0:00  \_ postgres: writer process
+20786 pts/2    S      0:00 pg_receivexlog -D /mnt/backup/t1/wal_archive --slot=pgarchive_t1 --verbose --no-password -d port=5435 user=replication
 
-==> /mnt/backup/t2/log/cron_snapshot.log <==
-2016-04-04T12:48:52Z *** expire-and-create-snapshot ***
-2016-04-04T12:48:52Z Expiring snapshots before 2016-03-07T12:48:52Z.
-2016-04-04T12:48:52Z No WAL segments to expire.
-2016-04-04T12:48:52Z Thinning snapshots to 1/day before 2016-03-21T12:48:52Z.
-2016-04-04T12:48:52Z The snapshot 2016-04-04T11:49:11Z already exists.
+Replication status:
+-[ RECORD 1 ]----+------------------------------   -[ RECORD 1 ]+-------------
+pid              | 20787                           slot_name    | pgarchive_t1
+usesysid         | 16385                           plugin       |
+usename          | replication                     slot_type    | physical
+application_name | pgarchive_t1                    datoid       |
+client_addr      |                                 database     |
+client_hostname  |                                 active       | t
+client_port      | -1                              active_pid   | 20787
+backend_start    | 2016-04-06 16:24:42.162962+02   xmin         |
+backend_xmin     |                                 catalog_xmin |
+state            | streaming                       restart_lsn  | 0/4C000000
+sent_location    | 0/4C0012C0
+write_location   | 0/4C000000
+flush_location   | 0/4C000000
+replay_location  |
+sync_priority    | 0
+sync_state       | async
 
-==> /mnt/backup/t2/log/wal_archive.log <==
-pg_receivexlog: starting log streaming at 0/16000000 (timeline 1)
-pg_receivexlog: finished segment at 0/17000000 (timeline 1)
-pg_receivexlog: finished segment at 0/18000000 (timeline 1)
-pg_receivexlog: finished segment at 0/19000000 (timeline 1)
-pg_receivexlog: finished segment at 0/1A000000 (timeline 1)
+==> /mnt/backup/t1/log/cron_snapshot.log <==
+2016-04-05T12:21:08Z Expiring snapshots before 2016-03-08T12:21:08Z.
+2016-04-05T12:21:08Z No WAL segments to expire.
+2016-04-05T12:21:08Z Thinning snapshots to 1/day before 2016-03-22T12:21:08Z.
+2016-04-05T12:21:09Z Creating snapshot 2016-04-05T12:19:52Z.
+Create a readonly snapshot of '/mnt/backup/t1/standby' in '/mnt/backup/t1/snapshots/2016-04-05T12:19:52Z'
 
-==> /mnt/backup/t2/log/standby/postgresql-Mon.csv <==
-2016-04-04 16:25:56.435 CEST,,,25783,,57025edc.64b7,8,,2016-04-04 14:32:28 CEST,,0,LOG,00000,"restored log file ""000000010000000000000017"" from archive",,,,,,,,,""
-2016-04-04 16:26:05.765 CEST,,,25783,,57025edc.64b7,9,,2016-04-04 14:32:28 CEST,,0,LOG,00000,"unexpected pageaddr 0/14000000 in log segment 000000010000000000000018, offset 0",,,,,,,,,""
-2016-04-04 18:01:07.197 CEST,,,25783,,57025edc.64b7,10,,2016-04-04 14:32:28 CEST,,0,LOG,00000,"restored log file ""000000010000000000000018"" from archive",,,,,,,,,""
-2016-04-04 18:01:07.968 CEST,,,25783,,57025edc.64b7,11,,2016-04-04 14:32:28 CEST,,0,LOG,00000,"restored log file ""000000010000000000000019"" from archive",,,,,,,,,""
-2016-04-04 18:01:11.967 CEST,,,25783,,57025edc.64b7,12,,2016-04-04 14:32:28 CEST,,0,LOG,00000,"unexpected pageaddr 0/15000000 in log segment 00000001000000000000001A, offset 0",,,,,,,,,""
+==> /mnt/backup/t1/log/wal_archive.log <==
+pg_receivexlog: disconnected; waiting 5 seconds to try again
+pg_receivexlog: starting log streaming at 0/4A000000 (timeline 1)
+pg_receivexlog: finished segment at 0/4B000000 (timeline 1)
+pg_receivexlog: finished segment at 0/4C000000 (timeline 1)
+pg_receivexlog: starting log streaming at 0/4C000000 (timeline 1)
+
+==> /mnt/backup/t1/log/standby/postgresql-Wed.csv <==
+2016-04-06 16:24:43.675 CEST,,,20805,,57051c2b.5145,2,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"entering standby mode",,,,,,,,,""
+2016-04-06 16:24:43.824 CEST,,,20805,,57051c2b.5145,3,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"restored log file ""00000001000000000000004B"" from archive",,,,,,,,,""
+2016-04-06 16:24:44.459 CEST,,,20805,,57051c2b.5145,4,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"redo starts at 0/4B000028",,,,,,,,,""
+2016-04-06 16:24:44.459 CEST,,,20805,,57051c2b.5145,5,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"consistent recovery state reached at 0/4C000000",,,,,,,,,""
+2016-04-06 16:24:44.829 CEST,,,20805,,57051c2b.5145,6,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"unexpected pageaddr 0/44000000 in log segment 00000001000000000000004C, offset 0",,,,,,,,,""
 ```
 
 To start containers on server reboots you have to create your own upstart or systemd service depending on local policies. Make sure pgarchive is executed running as the correct user (postgres), and with PGARCHIVE set to the correct container directory. You may run an arbitrary amount of containers on a single host, resources permitting.
