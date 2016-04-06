@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 ##############################################################################
 #
 # pgarchive -- A PostgreSQL Archive Server
@@ -148,9 +148,13 @@ debug() {
 configure() {
     set_container
     [[ -d "$container" ]] || fail "$PGARCHIVE does not exist."
+
     setup
     . $config
     export PATH="$path"
+
+    retired=""
+    [[ ! -f "$container/_RETIRED_" ]] || retired="y"
 }
 
 set_container() {
@@ -162,6 +166,7 @@ setup() {
     config="$container/pgarchive.conf"
     log="$container/log"
     standby="$container/standby"
+    standby_saved_conf="$log/standby_saved_conf"
     wal="$container/wal_archive"
     wal="$container/wal_archive"
     snapshots="$container/snapshots"
@@ -177,13 +182,33 @@ setup() {
     cron_btrfslog="$log/cron_btrfs.log"
 }
 
+check_retired() {
+    [[ -n "$retired" ]] || fail "Operation only possible for a retired container."
+}
+
+check_not_retired() {
+    [[ -z "$retired" ]] || fail "Operation not possible for a retired container."
+}
+
 psql_upstream() {
-    psql -d "$upstream" -c "$1"
+    cmd=$1
+    shift
+    psql -d "$upstream" -c "$cmd" $@
 }
 
 get_upstream_version() {
     psql -qtA -d "$upstream" -c \
        "select string_agg(n, '.') from (select unnest(regexp_matches(version(), E'PostgreSQL "'(\\d+)\\.(\\d+)'"'))) v(n)"
+}
+
+create_slot() {
+    log "Creating replication slot $slot in upstream DB cluster."
+    psql_upstream "select pg_create_physical_replication_slot('$slot');" >/dev/null
+}
+
+drop_slot() {
+    log "Dropping replication slot $slot in upstream DB cluster."
+    psql_upstream "select pg_drop_replication_slot('$slot');" >/dev/null
 }
 
 pg_ctl_cmd() {
@@ -247,9 +272,16 @@ container start     Start backup container, which starts both wal_archive and st
 container stop      Stop backup container.
 container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
 container dashboard Show detailed status and tails of all log files.
+container retire [--force]
+                    Disconnect from upstream DB, but keep data for restores.
+                    Releases the replication slot, and completely removes the standby subvolume.
+                    With --force errors are ignored, useful e.g. if the slot is gone already.
+container resync    Re-connect a retired container by creating a connection slot and doing a fresh
+                    pg_basebackup. The old standby configuration is preserved.
 container initcron  Add default cron entries to the calling user's crontab, all jobs disabled.
 container checkversions
                     Check versions of upstream DB and local PostgreSQL tools.
+container upstream  Open a psql shell to upstream database, additional arguments are passed through.
 
 wal_archive start   Start the wal_archive process. This process connects to the upstream DB
                     using the PostgreSQL's replication protocol, with the configured
@@ -384,8 +416,8 @@ _pgarchive() {
     [[ $COMP_CWORD -ge 3 ]] && subcmd="${COMP_WORDS[2]}"
 
     declare -A cmds
-    cmds["/"]="help container wal_archive standby snapshot clone"
-    cmds["container/"]="start stop status dashboard init initcron purge checkversions"
+    cmds["/"]="help container wal_archive standby snapshot clone cron"
+    cmds["container/"]="start stop status dashboard init purge initcron checkversions upstream retire resync"
     cmds["wal_archive/"]="start stop status list du log"
     cmds["standby/"]="start stop status restart reload log"
     cmds["snapshot/"]="create delete expire thin list"
@@ -405,6 +437,7 @@ _pgarchive() {
     cmds["clone/delete"]="CLONE"
     cmds["clone/log"]="CLONE"
     cmds["clone/psql"]="CLONE"
+    cmds["cron/"]="compress-wal-archive expire-and-create-snapshot defrag-btrfs"
 
     context=${cmds["${cmd}"/"${subcmd}"]} || return 1
     case "$context" in
@@ -490,10 +523,10 @@ container_init() {
     upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
 
     get_and_check_upstream_version
-    check_server_apps $upstream_version
+    check_pg_apps $upstream_version
 
     log "."
-    log "Setting up backup location $container..."
+    log "Setting up backup location $container."
     btrfs subv create "$container"
     btrfs subv create "$wal"
     btrfs subv create "$standby"
@@ -502,13 +535,7 @@ container_init() {
     create_own_conf
 
     log "."
-    log "Creating WAL archive at $wal..."
-    psql_upstream "select pg_create_physical_replication_slot('$slot');"
-    $0 wal_archive start
-    sleep 3
-
-    log "."
-    log "Creating warm standby..."
+    log "Creating warm standby."
     # Note: pg_basebackup sometimes exits non zero on mere warnings
     # (e.g. "could not send feedback packet"). For this reason let's not be picky here,
     # if something worse happened we'll find out soon enough.
@@ -524,13 +551,20 @@ container_init() {
     create_standby_conf
 
     log "."
-    first_snapshot_fix_wal_archive
+    log "Creating WAL archive at $wal."
+    create_slot
+    cp --reflink=always "$log/standby_xlog"/???????????????????????? "$wal"
+    $0 wal_archive start
+    sleep 1
+
+    log "."
+    log "Creating first snapshot."
     snapshot_create
 
     log "."
     sleep 2
     $0 standby start
-    sleep 10
+    sleep 5
     # Doing this earlier may cause clog problems:
     # http://www.postgresql.org/message-id/20150621213916.GD4797@alap3.anarazel.de
     rm -f "$standby/backup_label"*
@@ -614,9 +648,7 @@ get_and_check_upstream_version() {
     upstream_version=$(get_upstream_version)
     log "Detected upstream is PostgreSQL version $upstream_version."
     case $upstream_version in
-        '9.4')
-            ;;
-        '9.5')
+        9.4|9.5)
             ;;
         *)
             fail "upstream version $upstream_version is not supported"
@@ -624,7 +656,7 @@ get_and_check_upstream_version() {
     esac
 }
 
-check_server_apps() {
+check_pg_apps() {
     expected=$1
     for app in pg_ctl pg_receivexlog pg_basebackup pg_archivecleanup pg_controldata ; do
         $app --version | grep "$expected" > /dev/null || \
@@ -637,39 +669,79 @@ container_purge() {
 
     set +e
 
-    log "removing replication slot $slot"
     # if no $slot from config file fallback to $SLOT from environment
     slot=${slot:-$SLOT}
-    psql_upstream "select pg_drop_replication_slot('$slot');"
+    drop_slot
 
-    log "deleting btrfs volumes"
+    log "Deleting btrfs volumes."
     for snapshot in "$snapshots"/* ; do
         btrfs property set -t subvol "$snapshot" ro false
     done
     btrfs subvolume delete $btrfs_commit "$wal" "$standby" "$snapshots"/* "$clones"/* "$container"
 
-    log "please clean up the crontab yourself (crontab -e)"
+    log "Please clean up the crontab yourself (crontab -e)."
 }
+
+container_retire() {
+
+    log "Retiring container."
+    ! $0 wal_archive status >/dev/null || $0 wal_archive stop
+    ! $0 standby status >/dev/null || $0 standby stop
+
+    drop_slot
+    mkdir -p "$standby_saved_conf"
+    cp "$standby"/*.conf "$standby_saved_conf"
+    btrfs subvolume delete $btrfs_commit "$standby"
+    rm -rf "$log/standby_xlog"
+
+    touch "$container/_RETIRED_"
+}
+
+container_resync() {
+
+    log "Resyncing container."
+
+    log "."
+    log "Creating new standby."
+    btrfs subv create "$standby"
+    chmod 700 "$standby"
+    PGAPPNAME="${slot}_basebackup" \
+        pg_basebackup -D "$standby" --xlog-method=stream --progress --verbose --no-password \
+        --label "$slot base backup" -d "$upstream_repl" || true
+
+    mkdir "$standby/socket"
+    rm -f "$standby/recovery.*"
+    rm -rf "$standby/pg_log"
+    ln -s ../log/standby "$standby/pg_log"
+    rm -rf "$log/standby_xlog"
+    mv "$standby/pg_xlog" "$log/standby_xlog"
+    ln -s ../log/standby_xlog "$standby/pg_xlog"
+    cp "$standby_saved_conf"/* "$standby"
+    rm -rf "$standby_saved_conf"
+    rm "$container/_RETIRED_"
+
+    log "."
+    log "Resyncing wal_archive."
+    create_slot
+    cp --reflink=always "$standby/pg_xlog"/???????????????????????? "$wal"
+    $0 wal_archive start
+    sleep 1
+
+    log "."
+    log "Creating a snapshot."
+    snapshot_create
+
+    $0 standby start
+    sleep 5
+    rm -f "$standby/backup_label"*
+}
+
 
 snapshot_check_cleanup_position() {
     at_most_minutes_ago="-$1"
     [[ -n $(find $standby_cleanup_position -cmin $at_most_minutes_ago 2>/dev/null) ]] &&
         seg=$(cat "$standby_cleanup_position" 2>/dev/null) &&
         [[ -f "$wal/$seg" || -f "$wal/$seg.gz" ]]
-}
-
-first_snapshot_fix_wal_archive() {
-
-    # This is necessary because the standby's "REDO location" may be before the start
-    # of our wal_archive, and we do not include the standby's pg_xlog directoryin snapshots.
-    log "Copying missing segments to wal_archive."
-    for s in $(cd "$standby/pg_xlog" && ls -1); do
-        if [[ -f "$wal/$s" || -f "$wal/$s.partial" ]]; then
-            break
-        else
-            cp "$standby/pg_xlog/$s" "$wal/$s"
-        fi
-    done
 }
 
 snapshot_date() {
@@ -853,11 +925,6 @@ case "$cmd" in
                 fi
                 ;;
 
-            disconnect)
-                # remove the replication slot & ?
-                fail "TODO"
-                ;;
-
             *)
                 configure
                 ;;&
@@ -867,33 +934,53 @@ case "$cmd" in
                 ;;
 
             status)
-                status=0
-                $0 wal_archive status || status=1
-                $0 standby status || status=1
-                exit $status
+                if [[ -n "$retired" ]]; then
+                    echo "Container is retired."
+                else
+                    status1=0
+                    status2=0
+                    $0 wal_archive status || status1=1
+                    $0 standby status || status2=2
+                    exit $((status1 + status2))
+                fi
                 ;;
 
             dashboard)
-                status=0
-                $0 wal_archive status || status=1
-                $0 standby status || status=1
+                status1=0
+                status2=0
+                if [[ -n "$retired" ]]; then
+                    echo "Container is retired."
+                else
+                    $0 wal_archive status || status1=1
+                    $0 standby status || status2=2
+                fi
 
                 set +e
 
                 echo ""
                 df -hP "$container"
 
-                echo ""
-                echo "Replication status at upstream:"
-                psql_upstream "select * from pg_stat_replication where application_name = '$slot'"
+                if [[ $status1 = 0 || $status2 = 0 ]]; then
+                    echo ""
+                    echo "Processes:"
+                    [[ $status1 = 0 ]] && wal_pid=$(head -n1 "$log/wal_archive.pid" 2>/dev/null) || wal_pid=1234567890
+                    [[ $status2 = 0 ]] && standby_pid=$(head -n1 "$standby/postmaster.pid" 2>/dev/null) || standby_pid=1234567890
+                    ps --pid $wal_pid --pid $standby_pid --ppid $standby_pid f
+                fi
 
                 echo ""
+                echo "Replication status:"
+                pr -m -t -w 102 \
+                    <(psql_upstream "select * from pg_stat_replication where application_name = '$slot'" -x) \
+                    <(psql_upstream "select * from pg_replication_slots where slot_name = '$slot'" -x)
+
                 tail -n 5 "$log"/*.log "$standbylog"
 
-                exit $status
+                exit $((status1 + status2))
                 ;;
 
             start)
+                check_not_retired
                 $0 wal_archive start || true
                 $0 standby start
                 ;;
@@ -904,17 +991,34 @@ case "$cmd" in
                 ;;
 
             checkversions)
-                failed=""
+                status=0
                 current_upstream_version=$(get_upstream_version)
                 if [[ "$current_upstream_version" != "$upstream_version" ]]; then
                     log "Upstream is version $current_upstream_version instead of expected $upstream_version."
                     log "If upstream has been upgraded you have to create a new container to archive it, and you should retire this one."
-                    failed="y"
+                    status=1
                 else
                     log "Upstream version $upstream_version matches expectation."
                 fi
-                check_server_apps $upstream_version || failed="y"
-                [[ -n "$failed" ]] && exit 1
+                check_pg_apps $upstream_version || status=1
+                exit $status
+                ;;
+
+            retire)
+                check_not_retired
+                if [[ "$1" = '--force' ]]; then
+                    set +e
+                fi
+                container_retire
+                ;;
+
+            resync)
+                check_retired
+                container_resync
+                ;;
+
+            upstream)
+                psql "$upstream" "$@"
                 ;;
 
             *)
@@ -945,6 +1049,7 @@ case "$cmd" in
                 ;;
 
             start)
+                check_not_retired
                 running && fail "wal_archive is already running (pid=$curpid)"
 
                 log "starting wal_archive process $slot"
@@ -1011,6 +1116,7 @@ case "$cmd" in
                 ;;
 
             start|stop|status|reload|restart)
+                check_not_retired
                 pg_ctl_cmd "$standby" "$subcmd" $@
                 status=$?
                 [[ "$subcmd" = *start ]] && sleep 2
@@ -1039,6 +1145,7 @@ case "$cmd" in
                 ;;
 
             create)
+                check_not_retired
                 date=$(snapshot_date)
                 [[ -e "$snapshots/$date" ]] && log "The snapshot $date already exists." && exit 0
 
@@ -1134,10 +1241,6 @@ case "$cmd" in
 
             psql)
                 port=$(grep '^port =' "$clone"/postgresql.conf | tail -n1 | cut -d" " -f3)
-                if [[ ! -e $HOME/.psqlrc ]]; then
-                    log "Created a minimal .psqlrc to show \conninfo at startup."
-                    echo "\conninfo" > $HOME/.psqlrc
-                fi
                 psql -p $port "$@"
                 ;;
 
@@ -1177,7 +1280,7 @@ case "$cmd" in
                         log "compress-wal-archive up to $cutoff"
                         pg_archivecleanup -n "$wal" "$cutoff" | xargs -r -n 16 -P "$compress_threads" gzip -f
                     else
-                        log "No $standby_cleanup_position (this is normal for new containers only)."
+                        log "No $standby_cleanup_position."
                     fi
                 ) >>"$cron_wallog" 2>&1
                 ;;
@@ -1188,12 +1291,13 @@ case "$cmd" in
                     log "*** expire-and-create-snapshot ***"
                     $0 snapshot expire || true
                     $0 snapshot thin || true
-                    $0 snapshot create
+                    [[ -n "$retired" ]] || $0 snapshot create
                 ) >>"$cron_snapshotlog" 2>&1
                 ;;
 
             defrag-btrfs)
                 (
+                    [[ -z "$retired" ]] || fail "Skipping defrag, container is retired."
                     flock --nonblock 1 || fail "Another defrag-btrfs is still running."
                     log sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
                     time sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
