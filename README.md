@@ -4,7 +4,9 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 ## Release Status
 
-This is a very early alpha software. You will need to change parameters and possibly code in a shell script to make this work for you.
+This is a early alpha software. You will need to change parameters and possibly code in a shell script to make this work for you.
+
+Release 4.x supports PostgreSQL 9.4 and 9.5.
 
 It is used in production at [emarsys.com] to back up large (up to 1TB sizec, 100GB WAL per day) databases and you may find it useful or at least inspirational.
 
