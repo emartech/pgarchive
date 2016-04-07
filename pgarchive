@@ -51,6 +51,7 @@ min_wal_size = 80MB
 wal_keep_segments = 0
 synchronous_standby_names = ''
 hot_standby = off
+wal_retrieve_retry_interval = 60s
 "
 
 # template for standby's recovery.conf, __PGARCHIVE__ will be replaced by $0
