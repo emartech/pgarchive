@@ -4,7 +4,9 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 ## Release Status
 
-This is a very early alpha software. You will need to change parameters and possibly code in a shell script to make this work for you.
+This is a early alpha software. You will need to change parameters and possibly code in a shell script to make this work for you.
+
+Release 4.x supports PostgreSQL 9.4 and 9.5.
 
 It is used in production at [emarsys.com] to back up large (up to 1TB sizec, 100GB WAL per day) databases and you may find it useful or at least inspirational.
 
@@ -54,9 +56,8 @@ It is used in production at [emarsys.com] to back up large (up to 1TB sizec, 100
     * uses standard tools in a unique way
     * presumes some upstream configuration parameters, like CSV logging, and an available streaming replication connection and slot
     * at the moment contains many hard coded configuration parameters in the script instead of in a configuration file
-* requires PostgreSQL 9.4
-    * due to its architecture and use of [replication slots] earlier versions are not easily supported
-    * changes for 9.5 should be trivial and will be done soon
+* requires PostgreSQL 9.4+
+    * due to its architecture and use of [replication slots] earlier versions cannot be supported
     * does not support cross-version backup&restore, containers must match upstream databases exactly
 * requires [btrfs] for containers, despite well known problems with PostgreSQL
     * locally restored and started database clusters run on btrfs, and will be slow
@@ -69,7 +70,7 @@ It is used in production at [emarsys.com] to back up large (up to 1TB sizec, 100
 
 For more information please read the [manual](Manual.md).
 
-Created by Jürgen Strobel <juergen.strobel@emarsys.com> while working at [emarsys.com].
+Created by Jürgen Strobel <juergen.strobel@emarsys.com> while working at [emarsys.com]. See LICENSE for terms and conditions to use and redistribution.
 
 
 [btrfs]: https://btrfs.wiki.kernel.org/index.php/Main_Page
