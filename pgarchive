@@ -373,10 +373,10 @@ Required Environment for all commands:
 PGARCHIVE           Base path to a backup container, which must be on btrfs.
 
 Extra environment parameters are used by the 'container init' and 'purge' commands.
-All of these settings here are persisted to the $PGARCHIVE/pgarchive.conf config file:
+All of these settings here are persisted to the \$PGARCHIVE/pgarchive.conf config file:
 
 PATH                The PATH used internally. This must contain PostgreSQL's server applications
-                    (pg_ctl, pg_basebackup, ...) of the same version as the DB a container
+                    (pg_ctl, pg_basebackup, ...) of the same version as the DB cluster a container
                     is created for.
 SLOT                Create and use this replication slot at upstream. Defaults to
                     "pgarchive_<basename of \$PGARCHIVE>".
