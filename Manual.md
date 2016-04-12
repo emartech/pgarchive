@@ -8,7 +8,7 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 ### Overview
 
-`pgarchive` uses the concept of having a container to both store data and manage services for a PostgreSQL cluster. There may be several independant containers per host, and a database cluster may be backed up to serveral containers. The basic components and data flow for a single container are sketched in the following diagram. Some details like automatic expiry and btrfs filesystem maintenance are omitted for clarity.
+`pgarchive` uses the concept of having a container to both store data and manage services for a PostgreSQL cluster. There may be several independent containers per host, and a database cluster may be backed up to serveral containers. The basic components and data flow for a single container are sketched in the following diagram. Some details like automatic expiry and btrfs filesystem maintenance are omitted for clarity.
 
 ```
    +--------------------------+
