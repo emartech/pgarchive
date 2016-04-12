@@ -17,6 +17,10 @@ set -e
 # default PAGER
 export PAGER=${PAGER:-less}
 
+# clamp down locale, since we rely on date format and some other locale specifics
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
 # clear out incidential libpq settings
 unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE
 unset PGSERVICE PGSERVICEFILE PGREALM PGOPTIONS PGAPPNAME
