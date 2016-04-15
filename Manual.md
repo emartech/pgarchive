@@ -8,7 +8,9 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 ### Overview
 
-`pgarchive` uses the concept of having a container to both store data and manage services for a PostgreSQL cluster. There may be several independent containers per host, and a database cluster may be backed up to serveral containers. The basic components and data flow for a single container are sketched in the following diagram. Some details like automatic expiry and btrfs filesystem maintenance are omitted for clarity.
+`pgarchive` uses the concept of a container which stores data and meta data, and manages backup, restore and maintenance services for a single PostgreSQL cluster.
+
+There may be several independent containers per host, and a database cluster may be backed up to containers on multiple hosts. The basic components and data flow for a single container are sketched in the following diagram. Some details like automatic expiry and btrfs filesystem maintenance are omitted for clarity.
 
 ```
    +--------------------------+
@@ -24,11 +26,11 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 | pg_receivexlog    | restore_command  | warm standby PG process  |         |
 | /wal_archive      | ---------------> | /standby                 |         |
 +-------------------+                  +--------------------------+         |
-            |                                   |                           |
-            |                                   | btrfs snapshot            |
-            | restore_command                   | <cron>                    |
-            |          |                        V                           |
-            |  <user requests clone>   +--------------------------+         |
+    ^       |                                   |                           |
+    |       |                                   | btrfs snapshot            |
+    v       | restore_command                   | <cron>                    |
+  gzip      |          |                        V                           |
+ <cron>     |  <user creates clone>    +--------------------------+         |
             |          |               | snapshot archive         |         |
             |     btrfs snapshot       | /snapshots               |         |
             |  +---------------------- | /snapshots/<timestamp>   |         |
@@ -47,15 +49,15 @@ A PostgreSQL Archive Server providing fast and incremental Backup and Restore Se
 
 In the filesystem a container is a single directory passed via $PGARCHIVE in the environment to all `pgarchive` invocations. Pathes in the diagram above are assumed to be rooted at this directory.
 
-There are two demon subsystems for every container. One is a [pg_receivexlog] process pulling down WAL data from the upstream DB to $PGARCHIVE/wal_archive using the streaming replication protocol. There's also an optional cron job which compresses old WAL segments.
+There are two demon subsystems for every container. One is a [pg_receivexlog] process pulling down WAL data from the upstream DB to $PGARCHIVE/wal_archive using the streaming replication protocol. There's also an associated optional cron job which compresses WAL segments.
 
-The second demon subsystem is a PostgreSQL "warm" standby instance in $PGARCHIVE/standby which is initially created with [pg_basebackup] from the upstream DB. Afterwards it polls the local wal_archive and applies completed WAL segments to its cluster directory, so it mirrors the upstream DB with some lag.
+The second demon subsystem is a PostgreSQL "warm" standby instance in $PGARCHIVE/standby which is initially created with [pg_basebackup] from the upstream DB. Afterwards it polls the local wal_archive and applies completed WAL segments to its cluster directory, so it mirrors the upstream DB with some delay.
 
 The snapshot subsystem is purely cron-based, it uses btrfs to create snapshots of the standby cluster directory. This is fast and space efficient, although there's some redundancy with the wal_archive. Creating more snapshots will decrease time to recovery for some storage increase. Automatic time based thinning and expiry is included in a cron job.
 
 Finally snapshots may be "cloned" to separate directories by users. They are provisioned with a suitable [recovery.conf] automatically, and can be run instantly without manual modification. Once started they will perform recovery according to parameters in [recovery.conf], and present a usable PostgreSQL server instance some time afterwards. "Cloning" is just doing another btrfs snapshot under the hood and so is very fast, but the time needed for WAL playback will vary according to the recovery target (time) and available CPU and IO resources. Faster restore times can be traded for storage space required by more frequent snapshots. Clones are created and deleted by users only.
 
-Note that there is no full disaster recovery support yet. The user may rsync a clone back to a production server on his own, do fancy stuff with streaming replication, or whatever works best in his environment. A knowledgeable user could also copy a snapshot to some replacement server directly, connect remotely to the container's wal_archive, and thereby skip creating a local clone. It is not recommended to run a local clone as full production replacement (at least not for a longer than strictly necessary) because btrfs isn't up to this yet. Support for more scripted recovery options are planned for the future.
+There is no full disaster recovery support yet, but see the Operations section for suggestions on how to do this manually. Support for scripted disaster recovery is planned for the future.
 
 
 ### Filesystem Layout
@@ -156,15 +158,23 @@ Of course you should monitor free disk space for your containers, and other comm
 
 All invocations of pgarchive (except some internal ones) require PGARCHIVE to be set in your enviroment. For most commands it needs to point to an existing container directory, except for the `container init` command, which creates this directory. For convenience it is practical to set PGARCHIVE in `.bashrc` or a similar file, as described under Installation.
 
-`pgarchive` is defensively written (for a shell script) and will terminate itself on the first unexpected error using `set -e`. You have to be prepared to see and handle error messages of all underlying programs. `pgarchive` does its best to catch and handle errors wherever it is reasonable, and sometimes even gives advice about how to correct them.
+For per-site customization optionally a global config file is read and sourced as a shell script just before commands are executed. The location of this config file may be provided by $PGARCHIVE_CONF, and `/etc/pgarchive.conf` is tried if $PGARCHIVE_CONF is undefined. Note that containers always provide a config file which is read after this.
+
+`pgarchive` internally sets LC_ALL and LANG to `en_US.UTF-8`. The reason for this is twofold: the log files of containers should not depend on the locale of the admin starting them, and `pgarchive` may depend on output of commands in this locale. You may change this using the global configuration file, but be warned other locales are completely untested.
+
+`pgarchive` is defensively written (for a shell script) and will terminate itself on the first unexpected error using `set -e`. You have to be prepared to see and handle error messages of common shell utilities like ls, grep, gzip, and of PostgreSQL applications like pg_ctl, pg_receivexlog, pg_controldata, pg_archivecleanup, and more. `pgarchive` does its best to catch and handle many expected errors, and sometimes even gives advice about how to correct them, but many other errors just bubble through.
 
 ### Create And Manage Containers
 
 Containers may be created, purged, started, stopped and inspected in various ways using the `pgarchive container <CMD>` command group.
 
+#### `container init`
+
 New containers are created by the `init` command, which takes special extra parameters via environment. It detects the upstream PostgreSQL version automatically and expects the matching PostgreSQL tools ("Server Applications") to be found in its PATH, and refuses to work without them. It saves this PATH to a container config file for later use. So the PATH from `container init` will be remembered for a container, even when called later by cron, or when containers with different PATHes are created (e.g. containing PostgreSQL tools of a different version).
 
-`pgarchive` tends to be quite chatty during init, for example:
+It is required that upstream's postgresql.conf enables streaming replication and connection slots. It is also assumed to log to $PGDATA/pg_log using CSV format using the default weekly rotation, although violating this should break only non-essential parts of pgarchive.
+
+`pgarchive` is quite chatty during `init`, for example:
 
 ```
 $ UPSTREAM="port=5435" pgarchive container init
@@ -199,7 +209,11 @@ server starting
 2016-04-06T12:35:50Z Adding commented out cron jobs, you need to check and enable them using 'crontab -e'.
 ```
 
-After this the container is already up and running, doing its work of streaming replication data from the upstream DB to a local archive, and feeding completed WAL-segments to a standby process. This can be verified with the status command:
+To complete the container creation you need to enable the cron jobs using `crontab -e` (see Cron Jobs).
+
+#### `container status` and `dashboard`
+
+After `ìnit` the container is already up and running, doing its work of streaming replication data from the upstream DB to a local archive, and feeding completed WAL-segments to a standby process. This can be verified with the status command:
 
 ```
 $ pgarchive container status
@@ -208,9 +222,7 @@ pg_ctl: server is running (PID: 25780)
 /usr/pgsql-9.5/bin/postgres "-D" "/srv/backup/t1/standby"
 ```
 
-To complete the container creation you also need to enable the cron jobs (see Cron Jobs).
-
-There are `start` and `stop` commands which do the expected. As promised there's also a (very simple) dashboard command to get a summary of what's going on:
+As promised there's also a (very simple) dashboard command to get a summary of what's going on:
 
 ```
 $ pgarchive container dashboard
@@ -271,7 +283,13 @@ pg_receivexlog: starting log streaming at 0/4C000000 (timeline 1)
 2016-04-06 16:24:44.829 CEST,,,20805,,57051c2b.5145,6,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"unexpected pageaddr 0/44000000 in log segment 00000001000000000000004C, offset 0",,,,,,,,,""
 ```
 
-To start containers on server reboots you have to create your own upstart or systemd service depending on local policies. Make sure pgarchive is executed running as the correct user (postgres), and with PGARCHIVE set to the correct container directory. You may run an arbitrary amount of containers on a single host, resources permitting.
+#### `container start` and `stop`
+
+The `start` and `stop` commands start and stop both of the wal_archive and the standby demon subsystems.
+
+However to restart containers on server reboots you have to create your own upstart or systemd service depending on local policies. Make sure pgarchive is executed running as the correct user (postgres), and with PGARCHIVE set to the correct container directory. You may run an arbitrary amount of containers on a single host, resources permitting.
+
+#### `container retire` and `resync`
 
 A container may be retired using `container retire`. This breaks the synchronization with the upstream database by removing its replication slot and stopping wal streaming. It also completely deletes the standby directory. A retired container creates no new snapshots, but it still can be used to restore snapshots to clones. Also the expiry cron job may be left in place. This functionality is intended to gracefully decomission containers, e.g. after a major version upgrade of the upstream database, or to disable them for longer than you would like to hold the replication slot.
 
@@ -279,26 +297,32 @@ It is possible to resync a retired container using `container resync`. This will
 
 ### The wal_archive Subsystem
 
-This subsystem is a wrapper around pg_receivexlog streaming data from the upstream database to the wal_archive subdiretctory. There is also a cron job for data compression using gzip.
+This subsystem is a wrapper around pg_receivexlog streaming data from the upstream database to the wal_archive subdiretctory. There is also a cron job for data compression using gzip (See Cron Jobs).
 
-It may be started and stopped individually, but usually there is no need to since it is automatically started and stopped by the `container` commands. Status and log file viewers may be useful in case of problems.
+It may be started and stopped individually, but usually there is no need to since it is automatically started and stopped by the respective `container` commands. Status and log file viewing commands may be useful in case of problems.
+
+The `wal_archive du` command gives an overview of disk space used per day.
 
 ### The standby Subsystem
 
 This subsystem is wraps a minimal PostgreSQL standby instance, which is fed completed WAL segments from the wal_archive via `restore_command`.
 
-It may be started and stopped individually, but usually there is no need to since it is automatically started and stopped by the `container` commands. Status and log file viewers may be useful in case of problems.
+It may be started and stopped individually, but usually there is no need to since it is automatically started and stopped by the respective `container` commands. Status and log file viewing commands may be useful in case of problems.
 
 ### Manage Snapshots
 
-Snapshots are automatically named after their latest contained checkpoint time, formatted in a fixed way as ISO timestamp in UTC. Available snapshots can be listed. After `container init` there is already a first initial snapshot:
+#### `snapshot list`
+
+Snapshots are automatically named after their latest contained checkpoint time, formatted in a fixed way as ISO timestamp in UTC. Available snapshots can be listed using the `snapshot list` command. After `container init` there is already a first initial snapshot:
 
 ```
 $ pgarchive snapshot list
 2016-04-04T16:31:30Z
 ```
 
-Snapshots can be created and deleted on demand with the `snapshot create` and `snapshot delete` commands. Due to the naming policy some time needs to pass (and there needs to be some activity in the upstream DB) to create a new snapshot:
+#### `snapshot create` and `delete`
+
+Snapshots may be created and deleted explicitly with the `snapshot create` and `snapshot delete` commands. Due to the naming policy some time needs to pass (and there needs to be some activity in the upstream DB) to create a new snapshot:
 
 ```
 $ pgarchive snapshot create
@@ -309,15 +333,47 @@ $ pgarchive snapshot create
 Create a readonly snapshot of '/mnt/backup/t2/standby' in '/mnt/backup/t2/snapshots/2016-04-04T16:45:31Z'
 ```
 
-There is support for time based thinning and expiry with the `snapshot thin` and `snapshot expire` commands. The `pgarchive.conf` file holds the properties `expire_date` and `thin_daily_date` which control cutoff times. To debug this it may be useful to pass `--show` to the commands, and to override the config file values by setting `THIN_DAILY_DATE` and `EXPIRE_DATE` in the environment.
+#### `snapshot thin` and `expire`
 
-Usually you do not need to manually create, delete or even expire snapshots, as a cron job takes care of this. See Cron Jobs below for deatils.
+There is support for time based thinning and expiry with the `snapshot thin` and `snapshot expire` commands. Thinning reduces the number of snapshots per day to one for snapshots before the cutoff time, while expiry removes all snapshots before the cutoff time and also removes all related WAL segments from the wal_archive. The container's `pgarchive.conf` file holds the properties `expire_date` and `thin_daily_date` which control cutoff times. To debug this it may be useful to pass `--show` to the commands, and to override the config file values by setting `THIN_DAILY_DATE` and `EXPIRE_DATE` in the environment.
+
+Usually you do not need to manually create, delete or even expire snapshots, as a cron job takes care of all of this. See Cron Jobs below for details.
 
 ### Restoring Data
 
-Restoring data is done by cloning a snapshot locally (inspired by zfs' terminology).
+Restoring data is done by cloning a snapshot (inspired by zfs' terminology). Clones are named explicitly by the user creating them.
 
-TODO
+#### `clone create`, `duplicate` and `delete`
+
+The `create` command takes the new clone name, a snapshot timestamp, and optionally a timestamp for PITR. It creates the new clone in the clones directory, and sets up postgresql.conf and recovery.conf, but does not yet start recovery to give the admin a chance to modify these files manually. New clones are assigned a new unused port somewhere above 54000.
+
+Cloning is exceptionally fast, because contrary to most other backup solutions `pgarchive` can create a shallow copy-on-write copy of an existing snapshot, and only needs to run minimal recovery on startup. Frequent snapshots are cheap due to btrfs' cow, so we don't have to rely on doing large stretches of PITR.
+
+The `duplicate` command creates a (copy-on-write) copy of an existing clone.
+
+The `delete` command completely removes a (stopped) clone again. Old clones which are not deleted may lead to increased disk usage, or at least prevent freeing space when related snapshots are expired.
+
+#### `clone list`
+
+The `list` command lists created clones. With parameter `--status` it also lists which clones are running, and what port they are using.
+
+#### `clone start` and `stop`
+
+These commands start and stop clones. The first time a clone is started it will do recovery according to `recovery.conf`, and if successful this file will be renamed to `recovery.done`.
+
+#### `clone log`
+
+This will open today's postgres log file of a named clone in $PAGER, or `tail -f` it to stdout if `-f`is given as parameter. This assumes CSV log format, log storage in $PGDATA/pg_log, and the default daily log rotation with name of weekday in the filename as `postgresql-<DAY>.csv`.
+
+#### `clone psql`
+
+This convenience command opens a `psql` shell to a named clone, without having to provide command line parameters for its port.
+
+#### Disaster Recovery
+
+The clone directory has to be on btrfs, and it is not recommended to run clones as production replacements directly due to btrfs' bad performance characteristics, especially its widely volatile IO latency. Clones are useful to investigate the origin of an issue, or to extract partial data. Depending on your demands it may be possible to run your application on a clone temporily with reduced performance, or with essential services only.
+
+For full disaster recovery a clone needs to be copied back to a production server. The two easiest options probably are using `rsync` or `pg_basebackup` for this task, but at the moment `pgarchive` provides no further support for this. A more sophisticated approach might involve running essential services on the clone while setting up streaming replication back to a production machine, and doing a switch-over eventually.
 
 ### Cron Jobs
 
@@ -327,7 +383,7 @@ As reported by `container init` three cron jobs are created for each container, 
 # *** pgarchive container /srv/backup/t1 ***
 #*/5 * * * *            PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron compress-wal-archive
 #01 */4 * * *           PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron expire-and-create-snapshot
-#05 01 * * sun          PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron defrag-btrfs
+#05 01 * * sun          PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron maintenance
 ```
 
 You may adapt runtimes to you requirements. The first job rarely needs changing, unless you want to disable compression alltogether.
@@ -343,7 +399,7 @@ At the moment (other than patch level) upgrades of the upstream DB cannot be fol
 
 However it is easy to `retire` a container and create a new one. Make sure to have the correct (new) PostgreSQL tools in your PATH (pgarchive tries to check and complains about wrong versions). There is no data deduplication between containers so this may increase space usage, plan and monitor for space accordingly.
 
-Note that restoring snapshots in your old retired container still works as long as you keep your old version's bindir around. You may also continue to run its `expire-and-create-snapshot` cron job,  it just won't create new snapshots. When there's no need for the container any more  simply `purge` it. You may even rename your old container, but make sure to adapt the cron jobs referencing it if you do so.
+Note that restoring snapshots in your old retired container still works as long as you keep your old PostgreSQL version's bindir around. You may also continue to run its `expire-and-create-snapshot` cron job,  it just won't create new snapshots. When there's no need for the container any more  simply `purge` it. You may even rename your old container, but make sure to adapt the cron jobs referencing it if you do so.
 
 ### Upgrading `pgarchive` itself
 
@@ -354,6 +410,10 @@ First a promise: upgrading `pgarchive` will never require creating new container
 1. Manually modify containers as instructed by the section below.
 1. Re-start all containers.
 1. Verify.
+
+#### 0.3.x to 0.4.0
+
+The name of the cron job `defrag-btrfs` changed to `maintenance`, however the old name is still accepted so no changes are necessary.
 
 #### 0.2.x to 0.3.0
 
@@ -383,7 +443,7 @@ Sorry, you are on your own. No one else is using this.
 ## Command Reference (`pgarchive help`)
 
 ```
-PGARCHIVE=<dir> pgarchive <cmd> <arg...>
+PGARCHIVE=<dir> pgarchive-dev <cmd> <arg...>
 
 Commands and sub-commands:
 
@@ -482,30 +542,30 @@ clone psql <name> [arg] ...
                     Open a psql shell connected to a running named clone instance.
                     Additional arguments are passed through.
 
-cron compress-wal-archive <n>
+cron compress-wal-archive
                     Compress completed segments in wal_archive, which have already been
-                    processed by the standby process. Run n processes in parallel (default 1).
-                    The log is written to log/cron_wal_archive.log.
+                    processed by the standby process. Logs to log/cron_wal_archive.log.
 cron expire-and-create-snapshot
                     Expire old snapshots and wal segments, thin snapshots, and create a new one.
                     The log is written to log/cron_snapshot.log.
-cron defrag-btrfs   Defragment the standby directory, since PostgreSQL tends to cause a critical
-                    amount of fragmentation fast. Requires password-less sudo privileges to call
-                    "/sbin/btrfs filesystem defrag ...". The log is written to log/cron_btrfs.log.
+cron maintenance    Defragment the standby directory, since PostgreSQL tends to cause a critical
+                    amount of btrfs fragmentation fast. Requires password-less sudo privileges to
+                    call "/sbin/btrfs filesystem defrag ...". Logs to log/cron_maintenance.log.
 
 bash-completion     Output a bash completion snippet for this utility.
                     This may be saved to global or personal profiles, or eval'ed directly:
                         eval "$(pgarchive bash-completion)"
 
-Required Environment for all commands:
+Environment:
 
-PGARCHIVE           Base path to a backup container, which must be on btrfs.
+PGARCHIVE           Required base path to a backup container, which must be on btrfs.
+PGARCHIVE_CONF      Optional path to a global config file.
 
-Extra environment parameters are used by the 'container init' and 'purge' commands.
-All of these settings here are persisted to the /mnt/backup/t1/pgarchive.conf config file:
+        The following environment parameters are only used by the 'container init' and 'purge'
+        commands, and written to the $PGARCHIVE/pgarchive.conf container config file on 'init':
 
 PATH                The PATH used internally. This must contain PostgreSQL's server applications
-                    (pg_ctl, pg_basebackup, ...) of the same version as the DB a container
+                    (pg_ctl, pg_basebackup, ...) of the same version as the DB cluster a container
                     is created for.
 SLOT                Create and use this replication slot at upstream. Defaults to
                     "pgarchive_<basename of $PGARCHIVE>".
@@ -522,13 +582,17 @@ UPSTREAM_REPL       The connection info string the WAL archive process uses to f
                     new WAL segments. Defaults to UPSTREAM + " user=replication".
                     All of UPSTREAM's caveats apply.
 
-Container configuration file:
+Configuration files:
 
+$PGARCHIVE_CONF     If defined this is sourced as shell script after all internal variables and
+                    functions have been defined, but before commands are executed. This could be
+                    used to override internal variables and functions, at your own risk.
+/etc/pgarchive.conf This is only read if $PGARCHIVE_CONF is not defined, in the same fashion
+                    as $PGARCHIVE_CONF.
 $PGARCHIVE/pgarchive.conf
-                    Contains container specific settings, primarily those above and some
-                    extra parameters regarding expiry and other cron jobs.
-                    This is sourced as a shell script just before commands are executed and could
-                    be used to override most internal variables and functions, at your own risk.
+                    This per-container config file is always read after the global one.
+                    It contains container specific settings, like DB connection settings,
+                    the PATH to use, and some settings regarding expiry and cron jobs.
 ```
 
 [archive_timeout]: http://www.postgresql.org/docs/9.4/static/runtime-config-wal.html#GUC-ARCHIVE-TIMEOUT
