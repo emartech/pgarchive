@@ -132,7 +132,7 @@ recovery_target_action = promote
 
 # default filesystem volume management functions using btrfs
 
-# Create a new and empty subvolume at path $1. This path must not exist yet.
+# Create a new and empty subvolume at path $1. This path must not exist yet, but it's parent does.
 fs_create_subvolume() {
     btrfs subvolume create "$1"
 }
@@ -153,10 +153,11 @@ fs_delete_subvolume() {
 
 # Called in large intervals by cron, may do defragmentation or other tasks.
 # This version requires sudo privileges, because defragmentation may be done by root only.
+# This function is passed $PGARCHIVE as parameter.
 fs_maintenance() {
     btrfsprog=$(which btrfs)
-    log sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$standby"
-    time sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$standby"
+    log sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$1/standby"
+    time sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$1/standby"
 }
 
 ### internal utils
@@ -1342,8 +1343,8 @@ case "$cmd" in
                 (
                     [[ -z "$retired" ]] || fail "Skipping maintenance, container is retired."
                     flock --nonblock 1 || fail "Another maintenance job is still running."
-                    log sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
-                    time sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
+                    log "Maintenance starting."
+                    time fs_maintenance "$container"
                 ) >>"$cron_maintenancelog" 2>&1
                 ;;
 
