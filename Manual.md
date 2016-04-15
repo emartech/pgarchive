@@ -154,15 +154,19 @@ Of course you should monitor free disk space for your containers, and other comm
 
 ## Basic Operation
 
-`pgarchive` is a command line utility. It is intended to be used by the postgres user, and it contains a built in `help` command which outputs a summary of all (public) commands. See the Command Reference below.
+`pgarchive` is primarily a command line utility, but it also manages two external daemon processes for each container. It is intended to be used by the postgres user, and it contains a built in `help` command which outputs a summary of all (public) commands. See the Command Reference below.
+
+`pgarchive` is defensively written (for a shell script) and will terminate itself on the first unexpected error using `set -e`. You have to be prepared to see and handle error messages of common shell utilities like ls, grep, gzip, and of PostgreSQL applications like pg_ctl, pg_receivexlog, pg_controldata, pg_archivecleanup, and more. `pgarchive` does its best to catch and handle many expected errors, and sometimes even gives advice about how to correct them, but many other errors just bubble through.
+
+### Configuration
 
 All invocations of pgarchive (except some internal ones) require PGARCHIVE to be set in your enviroment. For most commands it needs to point to an existing container directory, except for the `container init` command, which creates this directory. For convenience it is practical to set PGARCHIVE in `.bashrc` or a similar file, as described under Installation.
 
-For per-site customization optionally a global config file is read and sourced as a shell script just before commands are executed. The location of this config file may be provided by $PGARCHIVE_CONF, and `/etc/pgarchive.conf` is tried if $PGARCHIVE_CONF is undefined. Note that containers always provide a config file which is read after this.
+For per-site customization optionally a global config file is read and sourced as a shell script just before commands are executed. The location of this config file may be provided by $PGARCHIVE_CONF, and `/etc/pgarchive.conf` is tried if $PGARCHIVE_CONF is undefined. Note that containers always provide a container config file which is read after this.
 
-`pgarchive` internally sets LC_ALL and LANG to `en_US.UTF-8`. The reason for this is twofold: the log files of containers should not depend on the locale of the admin starting them, and `pgarchive` may depend on output of commands in this locale. You may change this using the global configuration file, but be warned other locales are completely untested.
+By default operation does not require a global config file. Moreover, if you do provide a global config file, be careful about how modifying it may affect existing containers.
 
-`pgarchive` is defensively written (for a shell script) and will terminate itself on the first unexpected error using `set -e`. You have to be prepared to see and handle error messages of common shell utilities like ls, grep, gzip, and of PostgreSQL applications like pg_ctl, pg_receivexlog, pg_controldata, pg_archivecleanup, and more. `pgarchive` does its best to catch and handle many expected errors, and sometimes even gives advice about how to correct them, but many other errors just bubble through.
+`pgarchive` internally sets LC_ALL and LANG to `en_US.UTF-8`. The reason for this is twofold: the log files of containers should not depend on the locale of the admin starting them, and `pgarchive` may depend on output of commands in this locale. You may change this using the (global) configuration file, but be warned other locales are completely untested.
 
 ### Create And Manage Containers
 
