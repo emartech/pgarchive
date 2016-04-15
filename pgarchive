@@ -130,12 +130,39 @@ __TARGET__
 recovery_target_action = promote
 "
 
+# default filesystem volume management functions using btrfs
+
+# Create a new and empty subvolume at path $1. This path must not exist yet.
+fs_create_subvolume() {
+    btrfs subvolume create "$1"
+}
+
+# Create a new read only snapshot of $1 at $2. Try to set read-only if $3 is non empty.
+# $1 must exist and must have been created by fs_create_subvolume or fs_create_snapshot.
+fs_create_snapshot() {
+    [[ -n "$3" ]] && ro="-r" || ro=""
+    btrfs subvolume snapshot $ro "$1" "$2"
+}
+
+# Delete an existing subvolume (including snapshots) at path $1.
+fs_delete_subvolume() {
+    # some versions of btrfs insist ro subvols may not be deleted
+    btrfs property set -t subvol "$1" ro false
+    btrfs subvolume delete --commit-after "$1"
+}
+
+# Called in large intervals by cron, may do defragmentation or other tasks.
+# This version requires sudo privileges, because defragmentation may be done by root only.
+fs_maintenance() {
+    btrfsprog=$(which btrfs)
+    log sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$standby"
+    time sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$standby"
+}
 
 ### internal utils
 
 datefmt='%Y-%m-%dT%R:%SZ'
 pg_ctl_timeout=3600
-btrfs_commit='--commit-after'
 
 log() {
   echo `date +"$datefmt" --utc` "$*"
@@ -184,7 +211,7 @@ setup() {
     standbylog="$log/standby/postgresql-$(date +'%a').csv"
     cron_snapshotlog="$log/cron_snapshot.log"
     cron_wallog="$log/cron_wal_archive.log"
-    cron_btrfslog="$log/cron_btrfs.log"
+    cron_maintenancelog="$log/cron_maintenance.log"
 }
 
 check_retired() {
@@ -254,7 +281,55 @@ versioned_var() {
     eval "echo \"\$${v}\$$1\""
 }
 
-### longer & complex commands
+### internal commands
+#
+# Used internally as restore_command or similiar in generated postgresql.conf files.
+# They are executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
+# All restore_command scripts can handle plain and gzipped files.
+
+standby_restore() {
+
+    wal="../wal_archive"
+    src="$wal/$1"
+    zsrc="${src}.gz"
+    dst="$2"
+
+    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
+
+    cp --reflink=always "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
+}
+
+# The pgarchive_cleanup_position file is used by wal_archive compression,
+# snapshotting, and expiry to select appropriate WAL segments.
+standby_record_cleanup_position() {
+
+    cleanup_position="pgarchive_cleanup_position"
+    restartpoint="$1"
+
+    # Note: This rm works around a quirk in our monitoring setup.
+    # Forced rm of $cleanup_position updates the standby directory's mtime,
+    # which is later frozen as snapshot and used by activity monitoring.
+    # It would be both simpler and better to monitor snapshot/.'s mtime directly.
+    rm -f "$cleanup_position"
+    echo "$restartpoint" > "$cleanup_position"
+}
+
+clone_restore() {
+
+    wal="../../wal_archive"
+    src="$wal/$1"
+    zsrc="$wal/${1}.gz"
+    dst="$2"
+
+    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
+
+    cp --reflink=auto "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
+}
+
+
+### user commands
+#
+# Many simple user commands are handled inline in the main switch.
 
 help() {
     cat <<EOF
@@ -357,27 +432,27 @@ clone psql <name> [arg] ...
                     Open a psql shell connected to a running named clone instance.
                     Additional arguments are passed through.
 
-cron compress-wal-archive <n>
+cron compress-wal-archive
                     Compress completed segments in wal_archive, which have already been
-                    processed by the standby process. Run n processes in parallel (default 1).
-                    The log is written to log/cron_wal_archive.log.
+                    processed by the standby process. Logs to log/cron_wal_archive.log.
 cron expire-and-create-snapshot
                     Expire old snapshots and wal segments, thin snapshots, and create a new one.
                     The log is written to log/cron_snapshot.log.
-cron defrag-btrfs   Defragment the standby directory, since PostgreSQL tends to cause a critical
-                    amount of fragmentation fast. Requires password-less sudo privileges to call
-                    "/sbin/btrfs filesystem defrag ...". The log is written to log/cron_btrfs.log.
+cron maintenance    Defragment the standby directory, since PostgreSQL tends to cause a critical
+                    amount of btrfs fragmentation fast. Requires password-less sudo privileges to
+                    call "/sbin/btrfs filesystem defrag ...". Logs to log/cron_maintenance.log.
 
 bash-completion     Output a bash completion snippet for this utility.
                     This may be saved to global or personal profiles, or eval'ed directly:
                         eval "\$(pgarchive bash-completion)"
 
-Required Environment for all commands:
+Environment:
 
-PGARCHIVE           Base path to a backup container, which must be on btrfs.
+PGARCHIVE           Required base path to a backup container, which must be on btrfs.
+PGARCHIVE_CONF      Optional path to a global config file.
 
-Extra environment parameters are used by the 'container init' and 'purge' commands.
-All of these settings here are persisted to the \$PGARCHIVE/pgarchive.conf config file:
+        The following environment parameters are only used by the 'container init' and 'purge'
+        commands, and written to the \$PGARCHIVE/pgarchive.conf container config file on 'init'.
 
 PATH                The PATH used internally. This must contain PostgreSQL's server applications
                     (pg_ctl, pg_basebackup, ...) of the same version as the DB cluster a container
@@ -397,13 +472,17 @@ UPSTREAM_REPL       The connection info string the WAL archive process uses to f
                     new WAL segments. Defaults to UPSTREAM + " user=replication".
                     All of UPSTREAM's caveats apply.
 
-Container configuration file:
+Configuration files:
 
+\$PGARCHIVE_CONF     If defined this is sourced as shell script after all internal variables and
+                    functions have been defined, but before commands are executed. This could be
+                    used to override internal variables and functions, at your own risk.
+/etc/pgarchive.conf This is only read if \$PGARCHIVE_CONF is not defined, in the same fashion
+                    as \$PGARCHIVE_CONF.
 \$PGARCHIVE/pgarchive.conf
-                    Contains container specific settings, primarily those above and some
-                    extra parameters regarding expiry and other cron jobs.
-                    This is sourced as a shell script just before commands are executed and could
-                    be used to override most internal variables and functions, at your own risk.
+                    This per-container config file is always read after the global one.
+                    It contains container specific settings, like DB connection settings,
+                    the PATH to use, and some settings regarding expiry and cron jobs.
 
 EOF
 }
@@ -442,7 +521,7 @@ _pgarchive() {
     cmds["clone/delete"]="CLONE"
     cmds["clone/log"]="CLONE"
     cmds["clone/psql"]="CLONE"
-    cmds["cron/"]="compress-wal-archive expire-and-create-snapshot defrag-btrfs"
+    cmds["cron/"]="compress-wal-archive expire-and-create-snapshot maintenance"
 
     context=${cmds["${cmd}"/"${subcmd}"]} || return 1
     case "$context" in
@@ -475,53 +554,6 @@ complete -F _pgarchive pgarchive
 EOF
 }
 
-# For internal use only, by standby/recovery.conf.
-# This restore_command script can handle plain and gzipped files.
-# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
-standby_restore() {
-
-    wal="../wal_archive"
-    src="$wal/$1"
-    zsrc="${src}.gz"
-    dst="$2"
-
-    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
-
-    cp --reflink=always "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
-}
-
-# For internal use only, by standby/recovery.conf.
-# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
-# Note the $cleanup_position file is used by the wal_archive cronjob zipper, snapshotting,
-# and expiry.
-standby_record_cleanup_position() {
-
-    cleanup_position="pgarchive_cleanup_position"
-    restartpoint="$1"
-
-    # Note: This rm works around a quirk in our monitoring setup.
-    # Forced rm of $cleanup_position updates the standby directory's mtime,
-    # which is later frozen as snapshot and used by activity monitoring.
-    # It would be both simpler and better to monitor snapshot/.'s mtime directly.
-    rm -f "$cleanup_position"
-    echo "$restartpoint" > "$cleanup_position"
-}
-
-# For internal use only, by clones/*/recovery.conf.
-# This restore_command script can handle plain and gzipped files.
-# This is executed without the usual setup() ceremony, by postgres, with cwd=$PGDATA.
-clone_restore() {
-
-    wal="../../wal_archive"
-    src="$wal/$1"
-    zsrc="$wal/${1}.gz"
-    dst="$2"
-
-    [[ -d "$wal" ]] || fail "The wal_archive directory does not exist, something is very wrong."
-
-    cp --reflink=auto "$src" "$dst" 2>/dev/null || zcat "$zsrc" > "$dst" 2>/dev/null
-}
-
 container_init() {
 
     upstream=${UPSTREAM:-""}
@@ -532,9 +564,9 @@ container_init() {
 
     log "."
     log "Setting up backup location $container."
-    btrfs subv create "$container"
-    btrfs subv create "$wal"
-    btrfs subv create "$standby"
+    fs_create_subvolume "$container"
+    fs_create_subvolume "$wal"
+    fs_create_subvolume "$standby"
     mkdir "$log" "$snapshots" "$clones"
     chmod 700 "$container" "$standby"
     create_own_conf
@@ -643,7 +675,7 @@ init_cron() {
 # *** pgarchive container $container ***
 #*/5 * * * *            PGARCHIVE='$container' '$self' cron compress-wal-archive
 #01 */4 * * *           PGARCHIVE='$container' '$self' cron expire-and-create-snapshot
-#05 01 * * sun          PGARCHIVE='$container' '$self' cron defrag-btrfs
+#05 01 * * sun          PGARCHIVE='$container' '$self' cron maintenance
 
 EOF
 }
@@ -672,6 +704,7 @@ check_pg_apps() {
 
 container_purge() {
 
+    # continue over errors here
     set +e
 
     # if no $slot from config file fallback to $SLOT from environment
@@ -679,10 +712,9 @@ container_purge() {
     drop_slot
 
     log "Deleting btrfs volumes."
-    for snapshot in "$snapshots"/* ; do
-        btrfs property set -t subvol "$snapshot" ro false
+    for subvol in "$wal" "$standby" "$snapshots"/* "$clones"/* "$container"; do
+        fs_delete_subvolume "$subvol"
     done
-    btrfs subvolume delete $btrfs_commit "$wal" "$standby" "$snapshots"/* "$clones"/* "$container"
 
     log "Please clean up the crontab yourself (crontab -e)."
 }
@@ -696,7 +728,7 @@ container_retire() {
     drop_slot
     mkdir -p "$standby_saved_conf"
     cp "$standby"/*.conf "$standby_saved_conf"
-    btrfs subvolume delete $btrfs_commit "$standby"
+    fs_delete_subvolume "$standby"
     rm -rf "$log/standby_xlog"
 
     touch "$container/_RETIRED_"
@@ -708,7 +740,7 @@ container_resync() {
 
     log "."
     log "Creating new standby."
-    btrfs subv create "$standby"
+    fs_create_subvolume "$standby"
     chmod 700 "$standby"
     PGAPPNAME="${slot}_basebackup" \
         pg_basebackup -D "$standby" --xlog-method=stream --progress --verbose --no-password \
@@ -758,7 +790,7 @@ snapshot_create() {
 
     [[ -n "$1" ]] && date="$1" || date=$(snapshot_date)
     log "Creating snapshot $date."
-    btrfs subvolume snapshot -r "$standby" "$snapshots/$date"
+    fs_create_snapshot "$standby" "$snapshots/$date" "ro"
 }
 
 snapshot_expire() {
@@ -772,8 +804,7 @@ snapshot_expire() {
                 walcutoff=$(<"$snapshots/$s/pgarchive_cleanup_position")
                 [[ "$walcutoff" > "$maxwalcutoff" ]] && maxwalcutoff="$walcutoff"
             fi
-            btrfs property set -t subvol "$snapshots/$s" ro false
-            do_or_show btrfs subvolume delete $btrfs_commit "$snapshots/$s"
+            do_or_show fs_delete_subvolume "$snapshots/$s"
         fi
     done
     if [[ "$maxwalcutoff" = "000000000000000000000000" ]]; then
@@ -800,8 +831,7 @@ snapshot_thin_daily() {
         if [[ "$s" < "$cutoff" ]]; then
             day=${s:0:10}
             if [[ "$curday" = "$day" ]]; then
-                btrfs property set -t subvol "$snapshots/$s" ro false
-                do_or_show btrfs subvolume delete $btrfs_commit "$snapshots/$s"
+                do_or_show fs_delete_subvolume "$snapshots/$s"
             else
                 curday=$day
                 debug "keeping $s as first of day"
@@ -820,7 +850,7 @@ clone_create() {
     src="$snapshots/$2"
     [[ -d "$src" ]] || fail "$src does not exist"
 
-    btrfs subvolume snapshot "$src" "$clone"
+    fs_create_snapshot "$src" "$clone"
     log "created from $src" > "$clone/pgarchive.log"
 
     rm -rf "$clone/pg_log" "$clone/pg_xlog" "$clone/socket" "$clone"/postmaster.*
@@ -861,7 +891,7 @@ clone_duplicate() {
     [[ -n "$1" ]] || fail "new clone name required"
     [[ -e "$dup" ]] && fail "clone $1 already exists"
 
-    btrfs subvolume snapshot "$clone" "$dup"
+    fs_create_snapshot "$clone" "$dup"
     rm -f "$dup"/postmaster.*
     log "duplicated from clone $(basename $clone)" >> "$dup/pgarchive.log"
 
@@ -873,14 +903,19 @@ clone_duplicate() {
 
 ### main
 
+# Read extra global config, which may change any of the above variables and functions.
+if [[ -n "$PGARCHIVE_CONF" ]]; then
+    . "$PGARCHIVE_CONF"
+elif [[ -f /etc/pgarchive.conf ]]; then
+    . /etc/pgarchive.conf
+fi
+
+# command switch
 cmd=$1
 shift || true
-
 case "$cmd" in
 
-    help|--help)
-        help
-        ;;
+    # internal
 
     standby-restore)
         standby_restore $@
@@ -892,6 +927,12 @@ case "$cmd" in
 
     clone-restore)
         clone_restore $@
+        ;;
+
+    # user commands
+
+    help|--help)
+        help
         ;;
 
     bash-completion)
@@ -1140,7 +1181,6 @@ case "$cmd" in
 
         case "$subcmd" in
             list)
-                #sudo btrfs subvolume list $container | grep 'path snapshot/' | cut -d/ -f2
                 cd "$snapshots"
                 if [[ -n "$@" ]]; then
                     ls -1d $@
@@ -1188,9 +1228,7 @@ case "$cmd" in
                 ;;
 
             delete)
-                # btrfs doesn't allow users to delete ro subvolumes ever (bug?)
-                btrfs property set -t subvol "$snapshots/$1" ro false
-                btrfs subvolume delete $btrfs_commit "$snapshots/$1"
+                fs_delete_subvolume "$snapshots/$1"
                 ;;
 
             *)
@@ -1237,7 +1275,7 @@ case "$cmd" in
 
             delete)
                 # Note this fails on purpose if the instance is running.
-                btrfs subvolume delete $btrfs_commit "$clone"
+                fs_delete_subvolume $btrfs_commit "$clone"
                 ;;
 
             log)
@@ -1300,13 +1338,13 @@ case "$cmd" in
                 ) >>"$cron_snapshotlog" 2>&1
                 ;;
 
-            defrag-btrfs)
+            maintenance|defrag-btrfs)
                 (
-                    [[ -z "$retired" ]] || fail "Skipping defrag, container is retired."
-                    flock --nonblock 1 || fail "Another defrag-btrfs is still running."
+                    [[ -z "$retired" ]] || fail "Skipping maintenance, container is retired."
+                    flock --nonblock 1 || fail "Another maintenance job is still running."
                     log sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
                     time sudo -n /sbin/btrfs filesystem defrag -t1M -f -r "$standby"
-                ) >>"$cron_btrfslog" 2>&1
+                ) >>"$cron_maintenancelog" 2>&1
                 ;;
 
             *)
