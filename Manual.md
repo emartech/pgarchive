@@ -385,9 +385,9 @@ As reported by `container init` three cron jobs are created for each container, 
 
 ```
 # *** pgarchive container /srv/backup/t1 ***
-#*/5 * * * *            PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron compress-wal-archive
-#01 */4 * * *           PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron expire-and-create-snapshot
-#05 01 * * sun          PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive-dev' cron maintenance
+#*/5 * * * *            PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive' cron compress-wal-archive
+#01 */4 * * *           PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive' cron expire-and-create-snapshot
+#05 01 * * sun          PGARCHIVE='/srv/backup/t1' '/var/lib/pgsql/bin/pgarchive' cron maintenance
 ```
 
 You may adapt runtimes to you requirements. The first job rarely needs changing, unless you want to disable compression alltogether.
@@ -417,7 +417,7 @@ First a promise: upgrading `pgarchive` will never require creating new container
 
 #### 0.3.x to 0.4.0
 
-The name of the cron job `defrag-btrfs` changed to `maintenance`, however the old name is still accepted so no changes are necessary.
+The name of the cron job `defrag-btrfs` changed to `maintenance`, however the old name is still accepted so no changes are necessary. It will be removed completely with version 1.0.0.
 
 #### 0.2.x to 0.3.0
 
@@ -447,7 +447,7 @@ Sorry, you are on your own. No one else is using this.
 ## Command Reference (`pgarchive help`)
 
 ```
-PGARCHIVE=<dir> pgarchive-dev <cmd> <arg...>
+PGARCHIVE=<dir> pgarchive <cmd> <arg...>
 
 Commands and sub-commands:
 
