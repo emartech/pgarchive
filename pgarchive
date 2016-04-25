@@ -591,7 +591,7 @@ container_init() {
     log "."
     log "Creating WAL archive at $wal."
     create_slot
-    cp --reflink=always "$log/standby_xlog"/???????????????????????? "$wal"
+    seed_wal_archive
     $0 wal_archive start
     sleep 1
 
@@ -664,6 +664,12 @@ $(versioned_var standby_postgresql_conf)
 # @@@standby-config-end@@@
 
 EOF
+}
+
+seed_wal_archive() {
+    cp --reflink=always "$log/standby_xlog"/???????????????????????? "$wal"
+    last=$(ls "$wal" | egrep '^.{24}$' | tail -n 1)
+    mv "$wal/$last" "$wal/$last.partial"
 }
 
 init_cron() {
@@ -761,7 +767,7 @@ container_resync() {
     log "."
     log "Resyncing wal_archive."
     create_slot
-    cp --reflink=always "$standby/pg_xlog"/???????????????????????? "$wal"
+    seed_wal_archive
     $0 wal_archive start
     sleep 1
 
