@@ -596,7 +596,7 @@ EOF
 container_init() {
 
     upstream=${UPSTREAM:-""}
-    upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
+    upstream_repl=${UPSTREAM_REPL:-"$upstream"}
 
     get_and_check_upstream_version
     check_pg_apps $upstream_version
