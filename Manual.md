@@ -392,10 +392,18 @@ As reported by `container init` three cron jobs are created for each container, 
 
 You may adapt runtimes to you requirements. The first job rarely needs changing, unless you want to disable compression alltogether.
 
-The second job's runtime affects disk usage by how often snapshots are created, but keep in mind that frequent snapshots also reduce PITR time. There are more options regarding expiry in the `pgarchive.conf` config file. Expiry effects snapshots and the WAL archive.
+The second job's runtime affects disk usage by how often snapshots are created, but keep in mind that frequent snapshots also reduce PITR time. There are more options regarding expiry in the `pgarchive.conf` config file. Expiry removes both snapshots and segments from the WAL archive.
 
-Since `btrfs` is ill prepared to deal with the large number of random updates to table and index files done by the standby process, you will need to enable the third job too or performance will degrade over time. But it may cause quite some extra IO for considerable time, so it's best to do this during off-times, and not too often. You may experiment and monitor system performance to tune this. A tell-tale sign for btrfs fragmentation issues are climbing CPU utilization and increasing IO latency spikes.
+Since `btrfs` is ill prepared to deal with the large number of random updates to table and index files done by the standby process, you will need to enable the third job too or performance will degrade over time. But it may cause quite some extra IO for considerable time, so it's best to do this during off-times, and not too often. You may experiment and monitor system performance to tune this. A tell-tale sign for btrfs fragmentation issues are climbing CPU utilization and increasing IO latency spikes. If you are already doing btrfs maintenance in a different way, and it is aggressive enough, you should leave this one disabled.
 
+For the last job to work you will need a sudo rule allowing postgres to run defragmentation as root without using a password. Add the following to your sudoers file:
+
+```
+# allow postgres
+postgres        ALL = (root) NOPASSWD: /sbin/btrfs filesystem defrag *
+```
+
+If you have overridden the fs_* functions the third job calls fs_maintenance() and appends its output to log/cron_maintenance.log. It uses flock (1) to guard against concurrent calls.
 
 ### Upgrading the Upstream DB
 
