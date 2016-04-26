@@ -31,6 +31,15 @@ unset PGDATA
 
 ### global config, eventually to be moved out to /etc/pgarchive.conf (very incomplete)
 
+# For the following configuration snippets these placeholders will be replaced
+# intelligently and if applicable:
+#
+# __PGARCHIVE__     full path to self
+# __SLOT__          name of replication slot used
+# __PORT__          port to use for a clone
+# __TARGET__        whole clone target-selecting recovery.conf option
+# __CLONE__         clone name
+
 # added to postgresql.conf for the standby process
 standby_postgresql_conf_9_4="\
 listen_addresses = ''
@@ -45,6 +54,7 @@ hot_standby = off
 "
 
 standby_postgresql_conf_9_5="\
+cluster_name = '__SLOT__'
 listen_addresses = ''
 port = 5432
 unix_socket_directories = 'socket'
@@ -58,7 +68,7 @@ hot_standby = off
 wal_retrieve_retry_interval = 60s
 "
 
-# template for standby's recovery.conf, __PGARCHIVE__ will be replaced by $0
+# template for standby's recovery.conf
 standby_recovery_conf="\
 standby_mode = 'on'
 restore_command = '__PGARCHIVE__ standby-restore %f %p'
@@ -69,6 +79,7 @@ recovery_target_timeline = 'latest'
 # added to postgresql.conf for clones
 clone_postgresql_conf_9_4="\
 listen_addresses = ''
+port = __PORT__
 shared_buffers = 2GB
 checkpoint_segments = 16
 synchronous_standby_names = ''
@@ -79,7 +90,9 @@ wal_keep_segments = 0
 "
 
 clone_postgresql_conf_9_5="\
+cluster_name = '__CLONE__'
 listen_addresses = ''
+port = __PORT__
 shared_buffers = 2GB
 max_wal_size = 1GB
 min_wal_size = 80MB
@@ -90,7 +103,6 @@ wal_keep_segments = 0
 #synchronous_commit = off
 "
 
-# template for clones' recovery.conf, __PGARCHIVE__ and __TARGET__ will be interpolated
 clone_recovery_conf_9_4="\
 standby_mode = 'off'
 restore_command = '__PGARCHIVE__ clone-restore %f %p'
@@ -155,7 +167,7 @@ fs_delete_subvolume() {
 # This version requires sudo privileges, because defragmentation may be done by root only.
 # This function is passed $PGARCHIVE as parameter.
 fs_maintenance() {
-    btrfsprog=$(which btrfs)
+    local btrfsprog=$(which btrfs)
     log sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$1/standby"
     time sudo -n "$btrfsprog" filesystem defrag -t1M -f -r "$1/standby"
 }
@@ -224,7 +236,7 @@ check_not_retired() {
 }
 
 psql_upstream() {
-    cmd=$1
+    local cmd=$1
     shift
     psql -d "$upstream" -c "$cmd" $@
 }
@@ -245,8 +257,8 @@ drop_slot() {
 }
 
 pg_ctl_cmd() {
-    pgd=$1
-    cmd=$2
+    local pgd=$1
+    local cmd=$2
     shift 2
     pg_ctl -D "$pgd" "$cmd" -t $pg_ctl_timeout $@
 }
@@ -256,8 +268,8 @@ pg_ctl_status() {
 }
 
 new_clone_port() {
-    lastport=$(cat $log/last_clone_port 2>/dev/null) || lastport=$((54000 + $RANDOM % 700))
-    newport=$(($lastport + 1))
+    local lastport=$(cat $log/last_clone_port 2>/dev/null) || lastport=$((54000 + $RANDOM % 700))
+    local newport=$(($lastport + 1))
     echo $newport > "$log/last_clone_port"
     echo $newport
 }
@@ -277,9 +289,35 @@ enable_dry_run() {
 }
 
 versioned_var() {
-    v="$1_$(echo $upstream_version | sed 's/\./_/')"
-    # either $$v or $$1 must be empty, so don't mix versioned and unversioned
-    eval "echo \"\$${v}\$$1\""
+    local prefix="$1"
+    local varname="${prefix}_${upstream_version//./_}"
+    local value="${!varname}"
+    if [[ -n "$value" ]]; then
+        echo "$value"
+    else
+        value="${!prefix}"
+        if [[ -n "$value" ]]; then
+            echo "$value"
+        else
+            fail "Neither $varname nor $prefix is defined."
+        fi
+    fi
+}
+
+versioned_conf() {
+    local self="$(which $0)"
+    local tmpl=$(versioned_var "$1")
+    local header="$2"
+    local footer="$3"
+    local port="$4"
+    local target="$5"
+    local clone="$6"
+    tmpl=${tmpl//__PGARCHIVE__/$self}
+    tmpl=${tmpl//__SLOT__/$slot}
+    tmpl=${tmpl//__PORT__/$port}
+    tmpl=${tmpl//__TARGET__/$target}
+    tmpl=${tmpl//__CLONE__/$clone}
+    echo "${header}${tmpl}${footer}"
 }
 
 ### internal commands
@@ -558,7 +596,7 @@ EOF
 container_init() {
 
     upstream=${UPSTREAM:-""}
-    upstream_repl=${UPSTREAM_REPL:-"$upstream user=replication"}
+    upstream_repl=${UPSTREAM_REPL:-"$upstream"}
 
     get_and_check_upstream_version
     check_pg_apps $upstream_version
@@ -646,24 +684,21 @@ EOF
 
 create_standby_conf() {
 
-    self="$(which $0)"
-    tmpl=$(versioned_var standby_recovery_conf)
-    cat >"$standby/recovery.conf" <<EOF
-
+    header="
 # recovery.conf for pgarchive's standby subsystem
 
-${tmpl//__PGARCHIVE__/$self}
+"
+    versioned_conf "standby_recovery_conf" "$header" >"$standby/recovery.conf"
 
-EOF
-
-    cat >>"$standby/postgresql.conf" <<EOF
-
+    header="
 # @@@standby-config-start@@@
 # overrides for standby instance which is the source of the snapshots archive
-$(versioned_var standby_postgresql_conf)
+"
+    footer="
 # @@@standby-config-end@@@
 
-EOF
+"
+    versioned_conf "standby_postgresql_conf" "$header" "$footer" >>"$standby/postgresql.conf"
 }
 
 seed_wal_archive() {
@@ -863,30 +898,28 @@ clone_create() {
     rm -rf "$clone/pg_log" "$clone/pg_xlog" "$clone/socket" "$clone"/postmaster.*
     mkdir "$clone/pg_log" "$clone/pg_xlog"
 
-    tmpl="$(versioned_var clone_recovery_conf)"
-    self="$(which $0)"
-    tmpl="${tmpl//__PGARCHIVE__/$self}"
+    header="
+# recovery.conf for activating a clone of a snapshot
+
+"
+    port=$(new_clone_port)
     [[ -n "$3" ]] \
         && target="recovery_target_time = '$3'" \
         || target="recovery_target = 'immediate'"
-    tmpl="${tmpl//__TARGET__/$target}"
-    cat >"$clone/recovery.conf" <<EOF
+    versioned_conf "clone_recovery_conf" "$header" "" "$port" "$target" "$1" \
+        >"$clone/recovery.conf"
 
-# recovery.conf for activating a clone of a snapshot
-
-${tmpl}
-EOF
-
-    sed -i".snapshot" '/@@@standby-config-start@@@/,/@@standby-config-end@@@/d' "$clone/postgresql.conf"
-    cat >>"$clone/postgresql.conf" <<EOF
-
+    header="
 # @@@clone-config-start@@@
 # default overrides for a clone, feel free to change them as needed
-port = $(new_clone_port)
-$(versioned_var clone_postgresql_conf)
+"
+    footer="
 # @@@clone-config-end@@@
 
-EOF
+"
+    sed -i".snapshot" '/@@@standby-config-start@@@/,/@@standby-config-end@@@/d' "$clone/postgresql.conf"
+    versioned_conf "clone_postgresql_conf" "$header" "$footer" "$port" "$target" "$1" \
+        >>"$clone/postgresql.conf"
 
     log "Created new clone, recovery will be initiated once started."
     log "You may edit postgresql.conf and recovery.conf if custom options are desired."

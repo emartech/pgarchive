@@ -589,10 +589,9 @@ UPSTREAM            A connection info string used when accessing the upstream DB
                     Note that common libpq environment settings (PG*) which are active in the
                     caller's shell are explicitly cleared by pgarchive. This must work without
                     a password prompt, and the DB user must have sufficient privileges to
-                    create a connection slot.
-UPSTREAM_REPL       The connection info string the WAL archive process uses to fetch
-                    new WAL segments. Defaults to UPSTREAM + " user=replication".
-                    All of UPSTREAM's caveats apply.
+                    create and drop a connection slot for the init, purge, retire, resync commands.
+UPSTREAM_REPL       The connection info string the WAL archive process (pg_receivexlog) uses to
+                    stream new WAL segments. Defaults to UPSTREAM. All of UPSTREAM's caveats apply.
 
 Configuration files:
 
