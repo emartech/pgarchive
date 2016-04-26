@@ -420,6 +420,7 @@ First a promise: upgrading `pgarchive` will never require creating new container
 1. Stop all containers on a single host.
 1. Replace the old `pgarchive` version with the new one.
 1. Manually modify containers as instructed by the section below.
+1. If you are using a global config file which overrides internal parts of pgarchive, you are on your own to verify this still works as expected.
 1. Re-start all containers.
 1. Verify.
 
