@@ -1383,7 +1383,7 @@ case "$cmd" in
                     [[ -z "$retired" ]] || fail "Skipping maintenance, container is retired."
                     flock --nonblock 1 || fail "Another maintenance job is still running."
                     log "Maintenance starting."
-                    time fs_maintenance "$container"
+                    fs_maintenance "$container"
                 ) >>"$cron_maintenancelog" 2>&1
                 ;;
 
