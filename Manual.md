@@ -149,7 +149,7 @@ Backup services need monitoring. How exactly this is done is out of scope of pga
 
 * You absolutely need to monitor the size of your upstream DB's $PGDATA/pg_xlog directory. But you already do this, don't you? If offline pgarchive containers cannot stream replication data, old WAL segments cannot be released and will fill up pg_xlog [replication slots]. You may eventually need to decide to drop the replication slot, which will break synchronization with your container.
 
-Of course you should monitor free disk space for your containers, and other common system parameters.It's probably less useful to check for the presence of [pg_receivexlog] and PostgreSQL standby processes, because it's hard to associate them with multiple containers easily, and this may miss certain problems if subsystems become stuck without dying fully.
+Of course you should monitor free disk space for your containers, and other common system parameters. It's probably less useful to check for the presence of [pg_receivexlog] and PostgreSQL standby processes, because it's hard to associate them with multiple containers easily, and this may miss certain problems if subsystems become stuck without dying fully.
 
 
 ## Basic Operation
@@ -477,6 +477,7 @@ container start     Start backup container, which starts both wal_archive and st
 container stop      Stop backup container.
 container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
 container dashboard Show detailed status and tails of all log files.
+container monitor   Monitor all log files using "tail -f".
 container retire [--force]
                     Disconnect from upstream DB, but keep data for restores.
                     Releases the replication slot, and completely removes the standby subvolume.
