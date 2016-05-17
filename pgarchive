@@ -14,13 +14,6 @@
 # abort on all errors
 set -e
 
-# default PAGER
-export PAGER=${PAGER:-less}
-
-# clamp down locale, since we rely on date format and some other locale specifics
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
-
 # clear out incidential libpq settings
 unset PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE
 unset PGSERVICE PGSERVICEFILE PGREALM PGOPTIONS PGAPPNAME
@@ -30,6 +23,13 @@ unset PGDATA
 
 
 ### global config, eventually to be moved out to /etc/pgarchive.conf (very incomplete)
+
+# default PAGER
+export PAGER=${PAGER:-less}
+
+# clamp down locale, since we rely on date format and some other locale specifics
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # For the following configuration snippets these placeholders will be replaced
 # intelligently and if applicable:
@@ -391,6 +391,7 @@ container start     Start backup container, which starts both wal_archive and st
 container stop      Stop backup container.
 container status    Show status of wal_archive and standby subsystems, exit 1 if any is not running.
 container dashboard Show detailed status and tails of all log files.
+container monitor   Monitor all log files using "tail -f".
 container retire [--force]
                     Disconnect from upstream DB, but keep data for restores.
                     Releases the replication slot, and completely removes the standby subvolume.
@@ -540,7 +541,7 @@ _pgarchive() {
 
     declare -A cmds
     cmds["/"]="help container wal_archive standby snapshot clone cron"
-    cmds["container/"]="start stop status dashboard init purge initcron checkversions upstream retire resync"
+    cmds["container/"]="start stop status dashboard monitor init purge initcron checkversions upstream retire resync"
     cmds["wal_archive/"]="start stop status list du log"
     cmds["standby/"]="start stop status restart reload log"
     cmds["snapshot/"]="create delete expire thin list"
@@ -1063,6 +1064,10 @@ case "$cmd" in
                 tail -n 5 "$log"/*.log "$standbylog"
 
                 exit $((status1 + status2))
+                ;;
+
+            monitor)
+                tail -n0 -F $@ "$log"/*.log "$standbylog"
                 ;;
 
             start)
