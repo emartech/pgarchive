@@ -172,9 +172,9 @@ By default operation does not require a global config file. Moreover, if you do 
 
 Containers may be created, purged, started, stopped and inspected in various ways using the `pgarchive container <CMD>` command group.
 
-#### `container init`
+#### Container Creation
 
-New containers are created by the `init` command, which takes special extra parameters via environment. It detects the upstream PostgreSQL version automatically and expects the matching PostgreSQL tools ("Server Applications") to be found in its PATH, and refuses to work without them. It saves this PATH to a container config file for later use. So the PATH from `container init` will be remembered for a container, even when called later by cron, or when containers with different PATHes are created (e.g. containing PostgreSQL tools of a different version).
+New containers are created by the `container init` command, which takes special extra parameters via environment. It detects the upstream PostgreSQL version automatically and expects the matching PostgreSQL tools ("Server Applications") to be found in its PATH, and refuses to work without them. It saves this PATH to a container config file for later use. So the PATH from `container init` will be remembered for a container, even when called later by cron, or when containers with different PATHes are created (e.g. containing PostgreSQL tools of a different version).
 
 It is required that upstream's postgresql.conf enables streaming replication and connection slots. It is also assumed to log to $PGDATA/pg_log using CSV format using the default weekly rotation, although violating this should break only non-essential parts of pgarchive.
 
@@ -215,7 +215,7 @@ server starting
 
 To complete the container creation you need to enable the cron jobs using `crontab -e` (see Cron Jobs).
 
-#### `container status` and `dashboard`
+#### Viewing Container Status
 
 After `ìnit` the container is already up and running, doing its work of streaming replication data from the upstream DB to a local archive, and feeding completed WAL-segments to a standby process. This can be verified with the status command:
 
@@ -226,7 +226,7 @@ pg_ctl: server is running (PID: 25780)
 /usr/pgsql-9.5/bin/postgres "-D" "/srv/backup/t1/standby"
 ```
 
-As promised there's also a (very simple) dashboard command to get a summary of what's going on:
+There's a very simple dashboard to get a summary of what's going on:
 
 ```
 $ pgarchive container dashboard
@@ -287,13 +287,15 @@ pg_receivexlog: starting log streaming at 0/4C000000 (timeline 1)
 2016-04-06 16:24:44.829 CEST,,,20805,,57051c2b.5145,6,,2016-04-06 16:24:43 CEST,,0,LOG,00000,"unexpected pageaddr 0/44000000 in log segment 00000001000000000000004C, offset 0",,,,,,,,,""
 ```
 
-#### `container start` and `stop`
+For a life view of what's going the `container monitor` command tails all active log files to stdout. Note it does not pick up newly created log files or follow log rotation.
 
-The `start` and `stop` commands start and stop both of the wal_archive and the standby demon subsystems.
+#### Starting and Stopping a Container
+
+The `container start` and `stop` commands start and stop both of the wal_archive and the standby demon subsystems.
 
 However to restart containers on server reboots you have to create your own upstart or systemd service depending on local policies. Make sure pgarchive is executed running as the correct user (postgres), and with PGARCHIVE set to the correct container directory. You may run an arbitrary amount of containers on a single host, resources permitting.
 
-#### `container retire` and `resync`
+#### Retiring a Container
 
 A container may be retired using `container retire`. This breaks the synchronization with the upstream database by removing its replication slot and stopping wal streaming. It also completely deletes the standby directory. A retired container creates no new snapshots, but it still can be used to restore snapshots to clones. Also the expiry cron job may be left in place. This functionality is intended to gracefully decomission containers, e.g. after a major version upgrade of the upstream database, or to disable them for longer than you would like to hold the replication slot.
 
@@ -309,13 +311,13 @@ The `wal_archive du` command gives an overview of disk space used per day.
 
 ### The standby Subsystem
 
-This subsystem is wraps a minimal PostgreSQL standby instance, which is fed completed WAL segments from the wal_archive via `restore_command`.
+This subsystem wraps a minimal PostgreSQL standby instance, which is fed completed WAL segments from the wal_archive via `restore_command` ("log shipping").
 
 It may be started and stopped individually, but usually there is no need to since it is automatically started and stopped by the respective `container` commands. Status and log file viewing commands may be useful in case of problems.
 
-### Manage Snapshots
+### Managing Snapshots
 
-#### `snapshot list`
+#### Listing Snapshots
 
 Snapshots are automatically named after their latest contained checkpoint time, formatted in a fixed way as ISO timestamp in UTC. Available snapshots can be listed using the `snapshot list` command. After `container init` there is already a first initial snapshot:
 
@@ -324,7 +326,7 @@ $ pgarchive snapshot list
 2016-04-04T16:31:30Z
 ```
 
-#### `snapshot create` and `delete`
+#### Creating and Deleting Snapshots
 
 Snapshots may be created and deleted explicitly with the `snapshot create` and `snapshot delete` commands. Due to the naming policy some time needs to pass (and there needs to be some activity in the upstream DB) to create a new snapshot:
 
@@ -337,15 +339,15 @@ $ pgarchive snapshot create
 Create a readonly snapshot of '/mnt/backup/t2/standby' in '/mnt/backup/t2/snapshots/2016-04-04T16:45:31Z'
 ```
 
-#### `snapshot thin` and `expire`
+#### Snapshot Thinning and Expiry
 
-There is support for time based thinning and expiry with the `snapshot thin` and `snapshot expire` commands. Thinning reduces the number of snapshots per day to one for snapshots before the cutoff time, while expiry removes all snapshots before the cutoff time and also removes all related WAL segments from the wal_archive. The container's `pgarchive.conf` file holds the properties `expire_date` and `thin_daily_date` which control cutoff times. To debug this it may be useful to pass `--show` to the commands, and to override the config file values by setting `THIN_DAILY_DATE` and `EXPIRE_DATE` in the environment.
+There is support for time based thinning and expiry with the `snapshot thin` and `snapshot expire` commands. Thinning reduces the number of snapshots per day to one for snapshots before the cutoff time, while expiry removes all snapshots before the cutoff time and also removes all related WAL segments from the wal_archive. The container's `pgarchive.conf` file holds the properties `expire_date` and `thin_daily_date` which control cutoff times. To debug this it may be useful to pass `--show` to the commands, and you may override the config file values by setting `THIN_DAILY_DATE` and `EXPIRE_DATE` in the environment.
 
 Usually you do not need to manually create, delete or even expire snapshots, as a cron job takes care of all of this. See Cron Jobs below for details.
 
-### Restoring Data
+### Restoring Data with Clones
 
-Restoring data is done by cloning a snapshot (inspired by zfs' terminology). Clones are named explicitly by the user creating them.
+Restoring data is done by cloning a snapshot (inspired by zfs' terminology). Clones must be named explicitly by the user creating them.
 
 #### `clone create`, `duplicate` and `delete`
 
